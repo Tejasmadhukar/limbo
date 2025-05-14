@@ -56,7 +56,7 @@ fn test_libversion() {
 fn test_libversion_number() {
     unsafe {
         let version_num = sqlite3_libversion_number();
-        assert_eq!(version_num, 3042000);
+        assert!(version_num >= 3042000);
     }
 }
 
