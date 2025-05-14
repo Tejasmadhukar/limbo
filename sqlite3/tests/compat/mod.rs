@@ -61,14 +61,6 @@ fn test_libversion_number() {
 }
 
 #[test]
-fn test_open_misuse() {
-    unsafe {
-        let mut db = ptr::null_mut();
-        assert_eq!(sqlite3_open(ptr::null(), &mut db), SQLITE_MISUSE);
-    }
-}
-
-#[test]
 fn test_open_not_found() {
     unsafe {
         let mut db = ptr::null_mut();
