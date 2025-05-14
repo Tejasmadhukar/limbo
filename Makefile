@@ -7,21 +7,6 @@ UNAME_S := $(shell uname -s)
 # Executable used to execute the compatibility tests.
 SQLITE_EXEC ?= scripts/limbo-sqlite3
 
-# Static library to use for SQLite C API compatibility tests.
-BASE_SQLITE_LIB = ./target/$(CURRENT_RUST_TARGET)/debug/liblimbo_sqlite3.a
-# Static library headers to use for SQLITE C API compatibility tests
-BASE_SQLITE_LIB_HEADERS = ./target/$(CURRENT_RUST_TARGET)/debug/include/limbo_sqlite3
-
-
-# On darwin link core foundation
-ifeq ($(UNAME_S),Darwin)
-    SQLITE_LIB ?= ../../$(BASE_SQLITE_LIB) -framework CoreFoundation
-else
-    SQLITE_LIB ?= ../../$(BASE_SQLITE_LIB)
-endif
-
-SQLITE_LIB_HEADERS ?= ../../$(BASE_SQLITE_LIB_HEADERS)
-
 all: check-rust-version check-wasm-target limbo limbo-wasm
 .PHONY: all
 
@@ -89,8 +74,9 @@ test-time:
 	SQLITE_EXEC=$(SQLITE_EXEC) ./testing/time.test
 .PHONY: test-time
 
-test-sqlite3: limbo-c
-	LIBS="$(SQLITE_LIB)" HEADERS="$(SQLITE_LIB_HEADERS)" make -C sqlite3/tests test
+test-sqlite3:
+	cargo test -p limbo_sqlite3 --test compat
+	cargo test -p limbo_sqlite3 --test compat --features sqlite3
 .PHONY: test-sqlite3
 
 test-json:
