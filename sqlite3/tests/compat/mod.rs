@@ -62,6 +62,7 @@ fn test_libversion_number() {
 }
 
 #[test]
+#[ignore] // FIXME: SQLite SIGSEGV on this test on CI.
 fn test_open_not_found() {
     unsafe {
         let mut db = ptr::null_mut();
