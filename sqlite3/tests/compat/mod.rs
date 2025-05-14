@@ -97,6 +97,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // FIXME: SQLite SIGSEGV on this test on CI.
     fn test_prepare_misuse() {
         unsafe {
             let mut db = ptr::null_mut();
