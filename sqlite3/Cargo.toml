@@ -7,10 +7,12 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+build = "build.rs"
 
 [features]
 capi = []
 lfs = []
+sqlite3 = []
 
 [package.metadata.dist]
 dist = true
@@ -25,6 +27,11 @@ libc = "0.2.169"
 limbo_core = { path = "../core" }
 log = "0.4.22"
 
-
 [package.metadata.capi.header]
 name = "sqlite3.h"
+
+[[test]]
+name = "compat"
+path = "tests/compat/mod.rs"
+
+[build-dependencies]
