@@ -124,7 +124,7 @@ pub unsafe extern "C" fn sqlite3_open(
             SQLITE_OK
         }
         Err(e) => {
-            log::error!("error opening database {:?}", e);
+            log::trace!("error opening database {}: {:?}", filename, e);
             SQLITE_CANTOPEN
         }
     }
