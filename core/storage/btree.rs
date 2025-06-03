@@ -309,15 +309,6 @@ impl WriteInfo {
     }
 }
 
-/// Whether the cursor is currently pointing to a record.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum CursorHasRecord {
-    Yes {
-        rowid: Option<i64>, // not all indexes and btrees have rowids, so this is optional.
-    },
-    No,
-}
-
 /// Holds the state machine for the operation that was in flight when the cursor
 /// was suspended due to IO.
 enum CursorState {
@@ -3933,6 +3924,8 @@ impl BTreeCursor {
         if self.has_record.get() {
             let page = self.stack.top();
             return_if_locked_maybe_load!(self.pager, page);
+            // load record
+            let _ = return_if_io!(self.record());
             let page_type = page.get().get_contents().page_type();
             let page = page.get();
             let contents = page.get_contents();
@@ -4141,10 +4134,7 @@ impl BTreeCursor {
 
                 DeleteState::FindCell => {
                     let page = self.stack.top();
-                    let mut cell_idx = self.stack.current_cell_index() as usize;
-                    if cell_idx > 0 {
-                        cell_idx -= 1;
-                    }
+                    let cell_idx = self.stack.current_cell_index() as usize;
 
                     let page = page.get();
                     let contents = page.get().contents.as_ref().unwrap();
@@ -4292,24 +4282,26 @@ impl BTreeCursor {
                     let page = page.get();
                     let contents = page.get().contents.as_ref().unwrap();
                     let free_space = compute_free_space(contents, self.usable_space() as u16);
-                    let needs_balancing = free_space as usize * 3 > self.usable_space() * 2;
+                    let needs_balancing = self.stack.has_parent()
+                        && free_space as usize * 3 > self.usable_space() * 2;
 
-                    let target_key = if page.is_index() {
-                        let record = match &*return_if_io!(self.record()) {
-                            Some(record) => record.clone(),
-                            None => unreachable!("there should've been a record"),
-                        };
-                        DeleteSavepoint::Payload(record)
-                    } else {
-                        let Some(rowid) = return_if_io!(self.rowid())
+                    if needs_balancing {
+                        // FIXME(pere): cell index must be updated before calling `rowid` or
+                        // `record`
+                        let target_key = if page.is_index() {
+                            let record = match &*return_if_io!(self.record()) {
+                                Some(record) => record.clone(),
+                                None => unreachable!("there should've been a record"),
+                            };
+                            DeleteSavepoint::Payload(record)
+                        } else {
+                            let Some(rowid) = return_if_io!(self.rowid())
                         else {
                             panic!("cursor should be pointing to a record with a rowid");
                         };
-                        DeleteSavepoint::Rowid(rowid)
-                    };
-
-                    let delete_info = self.state.mut_delete_info().unwrap();
-                    if needs_balancing {
+                            DeleteSavepoint::Rowid(rowid)
+                        };
+                        let delete_info = self.state.mut_delete_info().unwrap();
                         if delete_info.balance_write_info.is_none() {
                             let mut write_info = WriteInfo::new();
                             write_info.state = WriteState::BalanceStart;
@@ -4734,9 +4726,7 @@ impl BTreeCursor {
         // build the new payload
         let page_type = page_ref.get().get().contents.as_ref().unwrap().page_type();
         let mut new_payload = Vec::with_capacity(record.len());
-        let rowid  = return_if_io!(self.rowid()) else {
-            panic!("cursor should be pointing to a record");
-        };
+        let rowid = return_if_io!(self.rowid());
         fill_cell_payload(
             page_type,
             rowid,
