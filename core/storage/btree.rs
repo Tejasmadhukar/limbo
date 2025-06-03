@@ -816,6 +816,7 @@ impl BTreeCursor {
                         // left child has: key 663, key 664, key 665
                         // we need to move to the previous parent (with e.g. key 662) when iterating backwards.
                         let mem_page = self.read_page(left_child_page as usize)?;
+                        self.stack.advance();
                         self.stack.push_backwards(mem_page);
                         continue;
                     }
@@ -1335,14 +1336,16 @@ impl BTreeCursor {
                 BTreeCell::IndexInteriorCell(IndexInteriorCell {
                     left_child_page, ..
                 }) => {
-                    if !self.going_upwards {
+                    if self.going_upwards {
+                        self.going_upwards = false;
+                        return Ok(CursorResult::Ok(true));
+                    } else {
                         let mem_page = self.read_page(*left_child_page as usize)?;
+                        // we still need to process this page later when going up, so let's go back
+                        self.stack.retreat();
                         self.stack.push(mem_page);
                         continue;
                     }
-
-                    self.going_upwards = false;
-                    return Ok(CursorResult::Ok(true));
                 }
                 BTreeCell::IndexLeafCell(IndexLeafCell { .. }) => {
                     return Ok(CursorResult::Ok(true));
@@ -1721,6 +1724,10 @@ impl BTreeCursor {
             );
 
             let cell_count = contents.cell_count();
+            if cell_count == 0 {
+                self.stack.set_cell_index(0);
+                return Ok(CursorResult::Ok(false));
+            }
             let min: isize = 0;
             let max: isize = cell_count as isize - 1;
 
@@ -1816,6 +1823,17 @@ impl BTreeCursor {
             let page = page.get();
             let contents = page.get().contents.as_ref().unwrap();
             let cell_count = contents.cell_count();
+            if cell_count == 0 {
+                self.stack.set_cell_index(0);
+                match seek_op.iteration_direction() {
+                    IterationDirection::Forwards => {
+                        return self.next();
+                    }
+                    IterationDirection::Backwards => {
+                        return self.prev();
+                    }
+                }
+            }
 
             let min: isize = 0;
             let max: isize = cell_count as isize - 1;
@@ -1869,14 +1887,14 @@ impl BTreeCursor {
                                 self.seek_state.set_not_found_leaf(true);
                                 self.stack.set_cell_index(cell_count as i32);
                             }
-                            return self.get_next_record();
+                            return self.next();
                         }
                         IterationDirection::Backwards => {
                             if !self.seek_state.get_not_found_leaf() {
                                 self.seek_state.set_not_found_leaf(true);
                                 self.stack.set_cell_index(-1);
                             }
-                            return self.get_prev_record();
+                            return self.prev();
                         }
                     }
                 };
@@ -2130,6 +2148,7 @@ impl BTreeCursor {
                         )?;
                         contents.overflow_cells.len()
                     };
+                    self.stack.set_cell_index(cell_idx as i32);
                     let write_info = self
                         .state
                         .mut_write_info()
@@ -3832,6 +3851,7 @@ impl BTreeCursor {
     pub fn seek_to_last(&mut self) -> Result<CursorResult<()>> {
         return_if_io!(self.move_to_rightmost());
         let cursor_has_record = return_if_io!(self.get_next_record());
+        self.invalidate_record();
         if !cursor_has_record {
             let is_empty = return_if_io!(self.is_empty_table());
             assert!(is_empty);
@@ -3852,11 +3872,13 @@ impl BTreeCursor {
     pub fn rewind(&mut self) -> Result<CursorResult<()>> {
         if self.mv_cursor.is_some() {
             let cursor_has_record = return_if_io!(self.get_next_record());
+            self.invalidate_record();
             self.has_record.replace(cursor_has_record);
         } else {
             self.move_to_root();
 
             let cursor_has_record = return_if_io!(self.get_next_record());
+            self.invalidate_record();
             self.has_record.replace(cursor_has_record);
         }
         Ok(CursorResult::Ok(()))
@@ -3865,25 +3887,37 @@ impl BTreeCursor {
     pub fn last(&mut self) -> Result<CursorResult<()>> {
         assert!(self.mv_cursor.is_none());
         match self.move_to_rightmost()? {
-            CursorResult::Ok(_) => self.prev(),
+            CursorResult::Ok(_) => {
+                let _ = self.prev();
+                Ok(CursorResult::Ok(()))
+            }
             CursorResult::IO => Ok(CursorResult::IO),
         }
     }
 
-    pub fn next(&mut self) -> Result<CursorResult<()>> {
-        let _ = return_if_io!(self.restore_context());
+    pub fn next(&mut self) -> Result<CursorResult<bool>> {
+        return_if_io!(self.restore_context());
         let cursor_has_record = return_if_io!(self.get_next_record());
         self.has_record.replace(cursor_has_record);
-        Ok(CursorResult::Ok(()))
+        self.invalidate_record();
+        Ok(CursorResult::Ok(cursor_has_record))
     }
 
-    pub fn prev(&mut self) -> Result<CursorResult<()>> {
+    fn invalidate_record(&mut self) {
+        self.get_immutable_record_or_create()
+            .as_mut()
+            .unwrap()
+            .invalidate();
+    }
+
+    pub fn prev(&mut self) -> Result<CursorResult<bool>> {
         assert!(self.mv_cursor.is_none());
-        let _ = return_if_io!(self.restore_context());
+        return_if_io!(self.restore_context());
         match self.get_prev_record()? {
             CursorResult::Ok(cursor_has_record) => {
                 self.has_record.replace(cursor_has_record);
-                Ok(CursorResult::Ok(()))
+                self.invalidate_record();
+                Ok(CursorResult::Ok(cursor_has_record))
             }
             CursorResult::IO => Ok(CursorResult::IO),
         }
@@ -3917,12 +3951,12 @@ impl BTreeCursor {
                     }) = cell else {
                         unreachable!("unexpected page_type");
                 };
-                return Ok(CursorResult::Ok(Some(_rowid)));
+                Ok(CursorResult::Ok(Some(_rowid)))
             } else {
-                return Ok(CursorResult::Ok(self.get_index_rowid_from_record()));
+                Ok(CursorResult::Ok(self.get_index_rowid_from_record()))
             }
         } else {
-            return Ok(CursorResult::Ok(None));
+            Ok(CursorResult::Ok(None))
         }
     }
 
@@ -3931,8 +3965,10 @@ impl BTreeCursor {
         // We need to clear the null flag for the table cursor before seeking,
         // because it might have been set to false by an unmatched left-join row during the previous iteration
         // on the outer loop.
+        tracing::trace!("seek(key={:?}, op={:?})", key, op);
         self.set_null_flag(false);
         let cursor_has_record = return_if_io!(self.do_seek(key, op));
+        self.invalidate_record();
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
         self.has_record.replace(cursor_has_record);
@@ -4023,13 +4059,14 @@ impl BTreeCursor {
                 if !moved_before && !matches!(self.state, CursorState::Write(..)) {
                     match key {
                         BTreeKey::IndexKey(_) => {
-                            return_if_io!(self
-                                .move_to(SeekKey::IndexKey(key.get_record().unwrap()), SeekOp::GE))
+                            return_if_io!(
+                                self.seek(SeekKey::IndexKey(key.get_record().unwrap()), SeekOp::GE)
+                            )
                         }
-                        BTreeKey::TableRowId(_) => return_if_io!(
-                            self.move_to(SeekKey::TableRowId(key.to_rowid()), SeekOp::EQ)
-                        ),
-                    }
+                        BTreeKey::TableRowId(_) => {
+                            return_if_io!(self.seek(SeekKey::TableRowId(key.to_rowid()), SeekOp::EQ))
+                        }
+                    };
                 }
                 return_if_io!(self.insert_into_page(key));
                 if key.maybe_rowid().is_some() {
@@ -7852,7 +7889,7 @@ mod tests {
         let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page);
         cursor.move_to_root();
         for i in 0..iterations {
-            let has_next = run_until_done(|| cursor.get_next_record(), pager.deref()).unwrap();
+            let has_next = run_until_done(|| cursor.next(), pager.deref()).unwrap();
             if !has_next {
                 panic!("expected Some(rowid) but got {:?}", cursor.has_record.get());
             };
