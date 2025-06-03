@@ -377,6 +377,15 @@ pub enum PageType {
     TableLeaf = 13,
 }
 
+impl PageType {
+    pub fn is_table(&self) -> bool {
+        match self {
+            PageType::IndexInterior | PageType::IndexLeaf => false,
+            PageType::TableInterior | PageType::TableLeaf => true,
+        }
+    }
+}
+
 impl TryFrom<u8> for PageType {
     type Error = LimboError;
 

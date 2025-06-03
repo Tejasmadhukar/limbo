@@ -1342,7 +1342,7 @@ pub fn op_column(
             let rowid = {
                 let mut index_cursor = state.get_cursor(index_cursor_id);
                 let index_cursor = index_cursor.as_btree_mut();
-                index_cursor.rowid()?
+                return_if_io!(index_cursor.rowid())
             };
             let mut table_cursor = state.get_cursor(table_cursor_id);
             let table_cursor = table_cursor.as_btree_mut();
@@ -1363,7 +1363,7 @@ pub fn op_column(
                 let mut cursor =
                     must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Column");
                 let cursor = cursor.as_btree_mut();
-                let record = cursor.record();
+                let record = return_if_io!(cursor.record());
                 let value = if let Some(record) = record.as_ref() {
                     if cursor.get_null_flag() {
                         RefValue::Null
@@ -1898,7 +1898,7 @@ pub fn op_row_id(
             let rowid = {
                 let mut index_cursor = state.get_cursor(index_cursor_id);
                 let index_cursor = index_cursor.as_btree_mut();
-                let record = index_cursor.record();
+                let record = return_if_io!(index_cursor.record());
                 let record = record.as_ref().unwrap();
                 let rowid = record.get_values().last().unwrap();
                 match rowid {
@@ -1920,7 +1920,7 @@ pub fn op_row_id(
     }
     let mut cursors = state.cursors.borrow_mut();
     if let Some(Cursor::BTree(btree_cursor)) = cursors.get_mut(*cursor_id).unwrap() {
-        if let Some(ref rowid) = btree_cursor.rowid()? {
+        if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
             state.registers[*dest] = Register::Value(Value::Integer(*rowid as i64));
         } else {
             state.registers[*dest] = Register::Value(Value::Null);
@@ -1954,7 +1954,7 @@ pub fn op_idx_row_id(
     let mut cursors = state.cursors.borrow_mut();
     let cursor = cursors.get_mut(*cursor_id).unwrap().as_mut().unwrap();
     let cursor = cursor.as_btree_mut();
-    let rowid = cursor.rowid()?;
+    let rowid = return_if_io!(cursor.rowid());
     state.registers[*dest] = match rowid {
         Some(rowid) => Register::Value(Value::Integer(rowid as i64)),
         None => Register::Value(Value::Null),
@@ -2154,7 +2154,7 @@ pub fn op_idx_ge(
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = *cursor.record() {
+        let pc = if let Some(ref idx_record) = *return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
@@ -2218,7 +2218,7 @@ pub fn op_idx_le(
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = *cursor.record() {
+        let pc = if let Some(ref idx_record) = *return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
@@ -2264,7 +2264,7 @@ pub fn op_idx_gt(
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = *cursor.record() {
+        let pc = if let Some(ref idx_record) = *return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
@@ -2310,7 +2310,7 @@ pub fn op_idx_lt(
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = *cursor.record() {
+        let pc = if let Some(ref idx_record) = *return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
@@ -3832,7 +3832,7 @@ pub fn op_insert(
         return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(record)), true));
         // Only update last_insert_rowid for regular table inserts, not schema modifications
         if cursor.root_page() != 1 {
-            if let Some(rowid) = cursor.rowid()? {
+            if let Some(rowid) = return_if_io!(cursor.rowid()) {
                 if let Some(conn) = program.connection.upgrade() {
                     conn.update_last_rowid(rowid);
                 }
@@ -3901,10 +3901,10 @@ pub fn op_idx_delete(
                     tracing::debug!(
                         "op_idx_delete(seek={}, record={} rowid={:?})",
                         &record,
-                        cursor.record().as_ref().unwrap(),
-                        cursor.rowid()
+                        return_if_io!(cursor.record()).as_ref().unwrap(),
+                        return_if_io!(cursor.rowid())
                     );
-                    if cursor.rowid()?.is_none() {
+                    if return_if_io!(cursor.rowid()).is_none() {
                         // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching
                         // index entry is found. This happens when running an UPDATE or DELETE statement and the
                         // index entry to be updated or deleted is not found. For some uses of IdxDelete

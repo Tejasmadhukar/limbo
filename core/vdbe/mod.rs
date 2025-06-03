@@ -499,11 +499,11 @@ fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorR
         CursorResult::Ok(()) => {}
         CursorResult::IO => return Ok(CursorResult::IO),
     }
-    let mut rowid = cursor
-        .rowid()?
-        .unwrap_or(0) // if BTree is empty - use 0 as initial value for rowid
-        .checked_add(1) // add 1 but be careful with overflows
-        .unwrap_or(i64::MAX); // in case of overflow - use i64::MAX
+    let mut rowid = match cursor.rowid()? {
+        CursorResult::Ok(Some(rowid)) => rowid.checked_add(1).unwrap_or(i64::MAX), // add 1 but be careful with overflows, in case of overflow - use i64::MAX
+        CursorResult::Ok(None) => 0,
+        CursorResult::IO => return Ok(CursorResult::IO),
+    };
     if rowid > i64::MAX.try_into().unwrap() {
         let distribution = Uniform::from(1..=i64::MAX);
         let max_attempts = 100;

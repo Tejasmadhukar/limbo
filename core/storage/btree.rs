@@ -635,7 +635,7 @@ pub struct BTreeCursor {
     move_to_state: CursorMoveToState,
     /// Separate state to read a record with overflow pages. This separation from `state` is necessary as
     /// we can be in a function that relies on `state`, but also needs to process overflow pages
-    read_overflow_state: Option<ReadPayloadOverflow>,
+    read_overflow_state: RefCell<Option<ReadPayloadOverflow>>,
     /// Contains the current cell_idx for `find_cell`
     find_cell_state: FindCellState,
 }
@@ -669,8 +669,9 @@ impl BTreeCursor {
             collations,
             seek_state: CursorSeekState::Start,
             move_to_state: CursorMoveToState::Start,
-            read_overflow_state: None,
+            read_overflow_state: RefCell::new(None),
             find_cell_state: FindCellState(None),
+            parse_record_state: RefCell::new(ParseRecordState::Init),
         }
     }
 
@@ -835,16 +836,16 @@ impl BTreeCursor {
     /// Reads the record of a cell that has overflow pages. This is a state machine that requires to be called until completion so everything
     /// that calls this function should be reentrant.
     fn process_overflow_read(
-        &mut self,
+        &self,
         payload: &'static [u8],
         start_next_page: u32,
         payload_size: u64,
     ) -> Result<CursorResult<()>> {
-        let res = match &mut self.read_overflow_state {
+        let res = match &mut *self.read_overflow_state.borrow_mut() {
             None => {
                 tracing::debug!("start reading overflow page payload_size={}", payload_size);
                 let page = self.read_page(start_next_page as usize)?;
-                self.read_overflow_state = Some(ReadPayloadOverflow {
+                *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
                     payload: payload.to_vec(),
                     next_page: start_next_page,
                     remaining_to_read: payload_size as usize - payload.len(),
@@ -900,7 +901,7 @@ impl BTreeCursor {
                         reuse_immutable.as_mut().unwrap(),
                     )?;
                 }
-                self.read_overflow_state = None;
+                *self.read_overflow_state.borrow_mut() = None;
                 Ok(CursorResult::Ok(()))
             }
             CursorResult::IO => Ok(CursorResult::IO),
@@ -1256,16 +1257,21 @@ impl BTreeCursor {
         }
         loop {
             let mem_page_rc = self.stack.top();
-            let cell_idx = self.stack.current_cell_index() as usize;
+            tracing::trace!(
+                "current_before_advance id={} cell={}",
+                mem_page_rc.get().get().id,
+                self.stack.current_cell_index()
+            );
 
+            return_if_locked_maybe_load!(self.pager, mem_page_rc);
+            // Important to advance only after loading the page in order to not advance > 1 times
+            self.stack.advance();
+            let cell_idx = self.stack.current_cell_index() as usize;
             tracing::trace!(
                 "current id={} cell={}",
                 mem_page_rc.get().get().id,
                 cell_idx
             );
-            return_if_locked_maybe_load!(self.pager, mem_page_rc);
-            // Important to advance only after loading the page in order to not advance > 1 times
-            self.stack.advance();
             let mem_page = mem_page_rc.get();
 
             let contents = mem_page.get().contents.as_ref().unwrap();
@@ -3890,10 +3896,34 @@ impl BTreeCursor {
                 mv_cursor.current_row_id().map(|rowid| rowid.row_id),
             ));
         }
-        Ok(match self.has_record.get() {
-            CursorHasRecord::Yes { rowid: Some(rowid) } => Some(rowid),
-            _ => None,
-        })
+        if self.has_record.get() {
+            let page = self.stack.top();
+            return_if_locked_maybe_load!(self.pager, page);
+            let page_type = page.get().get_contents().page_type();
+            let page = page.get();
+            let contents = page.get_contents();
+            let cell_idx = self.stack.current_cell_index();
+            let cell = contents.cell_get(
+                cell_idx as usize,
+                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
+                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                self.usable_space(),
+            )?;
+            if page_type.is_table() {
+                let BTreeCell::TableLeafCell(TableLeafCell {
+                        _rowid,
+                        _payload,
+                    ..
+                    }) = cell else {
+                        unreachable!("unexpected page_type");
+                };
+                return Ok(CursorResult::Ok(Some(_rowid)));
+            } else {
+                return Ok(CursorResult::Ok(self.get_index_rowid_from_record()));
+            }
+        } else {
+            return Ok(CursorResult::Ok(None));
+        }
     }
 
     pub fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<bool>> {
@@ -3912,7 +3942,7 @@ impl BTreeCursor {
     /// Return a reference to the record the cursor is currently pointing to.
     /// If record was not parsed yet, then we have to parse it and in case of I/O we yield control
     /// back.
-    pub fn record(&mut self) -> Result<CursorResult<Ref<Option<ImmutableRecord>>>> {
+    pub fn record(&self) -> Result<CursorResult<Ref<Option<ImmutableRecord>>>> {
         let invalidated = self
             .reusable_immutable_record
             .borrow()
@@ -3938,17 +3968,28 @@ impl BTreeCursor {
             payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
             self.usable_space(),
         )?;
-        let BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                    payload,
-                    payload_size,
-                    first_overflow_page,
-                    ..
-                }) = &cell
-                else {
-                    unreachable!("unexpected cell type: {:?}", cell);
-                };
+        let (payload, payload_size, first_overflow_page) = match cell {
+            BTreeCell::TableLeafCell(TableLeafCell {
+                _rowid,
+                _payload,
+                payload_size,
+                first_overflow_page,
+            }) => (_payload, payload_size, first_overflow_page),
+            BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                left_child_page: _,
+                payload,
+                payload_size,
+                first_overflow_page,
+            }) => (payload, payload_size, first_overflow_page),
+            BTreeCell::IndexLeafCell(IndexLeafCell {
+                payload,
+                first_overflow_page,
+                payload_size,
+            }) => (payload, payload_size, first_overflow_page),
+            _ => unreachable!("unexpected page_type"),
+        };
         if let Some(next_page) = first_overflow_page {
-            return_if_io!(self.process_overflow_read(payload, *next_page, *payload_size))
+            return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
         } else {
             crate::storage::sqlite3_ondisk::read_record(
                 payload,
@@ -3992,10 +4033,7 @@ impl BTreeCursor {
                 }
                 return_if_io!(self.insert_into_page(key));
                 if key.maybe_rowid().is_some() {
-                    let int_key = key.to_rowid();
-                    self.has_record.replace(CursorHasRecord::Yes {
-                        rowid: Some(int_key),
-                    });
+                    self.has_record.replace(true);
                 }
             }
         };
@@ -4038,8 +4076,8 @@ impl BTreeCursor {
                         page.get().get_contents().page_type(),
                         PageType::TableLeaf | PageType::TableInterior
                     ) {
-                        let _target_rowid = match self.has_record.get() {
-                            CursorHasRecord::Yes { rowid: Some(rowid) } => rowid,
+                        let _target_rowid = match return_if_io!(self.rowid()) {
+                            Some(rowid) => rowid,
                             _ => {
                                 self.state = CursorState::None;
                                 return Ok(CursorResult::Ok(()));
@@ -4220,9 +4258,13 @@ impl BTreeCursor {
                     let needs_balancing = free_space as usize * 3 > self.usable_space() * 2;
 
                     let target_key = if page.is_index() {
-                        DeleteSavepoint::Payload(self.record().as_ref().unwrap().clone())
+                        let record = match &*return_if_io!(self.record()) {
+                            Some(record) => record.clone(),
+                            None => unreachable!("there should've been a record"),
+                        };
+                        DeleteSavepoint::Payload(record)
                     } else {
-                        let CursorHasRecord::Yes { rowid: Some(rowid) } = self.has_record.get()
+                        let Some(rowid) = return_if_io!(self.rowid())
                         else {
                             panic!("cursor should be pointing to a record with a rowid");
                         };
@@ -4243,7 +4285,7 @@ impl BTreeCursor {
                         return Ok(CursorResult::Ok(()));
                     }
                     // Only reaches this function call if state = DeleteState::WaitForBalancingToComplete
-                    self.save_context();
+                    // self.save_context();
                 }
 
                 DeleteState::WaitForBalancingToComplete { target_key } => {
@@ -4319,7 +4361,7 @@ impl BTreeCursor {
     pub fn key_exists_in_index(&mut self, key: &ImmutableRecord) -> Result<CursorResult<bool>> {
         return_if_io!(self.seek(SeekKey::IndexKey(key), SeekOp::GE));
 
-        let record_opt = self.record();
+        let record_opt = return_if_io!(self.record());
         match record_opt.as_ref() {
             Some(record) => {
                 // Existing record found — compare prefix
@@ -4655,7 +4697,7 @@ impl BTreeCursor {
         // build the new payload
         let page_type = page_ref.get().get().contents.as_ref().unwrap().page_type();
         let mut new_payload = Vec::with_capacity(record.len());
-        let CursorHasRecord::Yes { rowid } = self.has_record.get() else {
+        let rowid  = return_if_io!(self.rowid()) else {
             panic!("cursor should be pointing to a record");
         };
         fill_cell_payload(
@@ -4840,27 +4882,27 @@ impl BTreeCursor {
     }
 
     /// Save cursor context, to be restored later
-    pub fn save_context(&mut self) {
-        if let CursorHasRecord::Yes { rowid } = self.has_record.get() {
-            self.valid_state = CursorValidState::RequireSeek;
-            match self.stack.top().get().get_contents().page_type() {
-                PageType::TableInterior | PageType::TableLeaf => {
-                    self.context = Some(CursorContext::TableRowId(rowid.expect(
-                        "table cells should have a rowid since we don't support WITHOUT ROWID tables",
-                    )));
-                }
-                PageType::IndexInterior | PageType::IndexLeaf => {
-                    self.context = Some(CursorContext::IndexKeyRowId(
-                        self.reusable_immutable_record
-                            .borrow()
-                            .as_ref()
-                            .unwrap()
-                            .clone(),
-                    ));
-                }
-            }
-        }
-    }
+    // pub fn save_context(&mut self) {
+    //     if let CursorHasRecord::Yes { rowid } = self.has_record.get() {
+    //         self.valid_state = CursorValidState::RequireSeek;
+    //         match self.stack.top().get().get_contents().page_type() {
+    //             PageType::TableInterior | PageType::TableLeaf => {
+    //                 self.context = Some(CursorContext::TableRowId(rowid.expect(
+    //                     "table cells should have a rowid since we don't support WITHOUT ROWID tables",
+    //                 )));
+    //             }
+    //             PageType::IndexInterior | PageType::IndexLeaf => {
+    //                 self.context = Some(CursorContext::IndexKeyRowId(
+    //                     self.reusable_immutable_record
+    //                         .borrow()
+    //                         .as_ref()
+    //                         .unwrap()
+    //                         .clone(),
+    //                 ));
+    //             }
+    //         }
+    //     }
+    // }
 
     /// If context is defined, restore it and set it None on success
     fn restore_context(&mut self) -> Result<CursorResult<()>> {
@@ -4959,7 +5001,7 @@ impl PageStack {
     }
 
     fn push(&self, page: BTreePage) {
-        self._push(page, 0);
+        self._push(page, -1);
     }
 
     fn push_backwards(&self, page: BTreePage) {
@@ -6498,7 +6540,9 @@ mod tests {
                     for key in keys.iter() {
                         tracing::trace!("seeking key: {}", key);
                         run_until_done(|| cursor.next(), pager.deref()).unwrap();
-                        let cursor_rowid = cursor.rowid().unwrap().unwrap();
+                        let cursor_rowid = run_until_done(|| cursor.rowid(), pager.deref())
+                            .unwrap()
+                            .unwrap();
                         if *key != cursor_rowid {
                             valid = false;
                             println!("key {} is not found, got {}", key, cursor_rowid);
@@ -6529,7 +6573,9 @@ mod tests {
             for key in keys.iter() {
                 tracing::trace!("seeking key: {}", key);
                 run_until_done(|| cursor.next(), pager.deref()).unwrap();
-                let cursor_rowid = cursor.rowid().unwrap().unwrap();
+                let cursor_rowid = run_until_done(|| cursor.rowid(), pager.deref())
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(
                     *key, cursor_rowid,
                     "key {} is not found, got {}",
@@ -7806,11 +7852,13 @@ mod tests {
         let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page);
         cursor.move_to_root();
         for i in 0..iterations {
-            let CursorHasRecord::Yes { rowid: Some(rowid) } =
-                run_until_done(|| cursor.get_next_record(None), pager.deref()).unwrap()
-            else {
+            let has_next = run_until_done(|| cursor.get_next_record(), pager.deref()).unwrap();
+            if !has_next {
                 panic!("expected Some(rowid) but got {:?}", cursor.has_record.get());
             };
+            let rowid = run_until_done(|| cursor.rowid(), pager.deref())
+                .unwrap()
+                .unwrap();
             assert_eq!(rowid, i as i64, "got!=expected");
         }
     }
