@@ -4842,6 +4842,7 @@ impl BTreeCursor {
                 self.count += contents.cell_count();
             }
 
+            self.stack.advance();
             let cell_idx = self.stack.current_cell_index() as usize;
 
             // Second condition is necessary in case we return if the page is locked in the loop below
@@ -4855,7 +4856,6 @@ impl BTreeCursor {
                     }
 
                     // Move to parent
-                    self.going_upwards = true;
                     self.stack.pop();
 
                     mem_page_rc = self.stack.top();
@@ -4882,7 +4882,6 @@ impl BTreeCursor {
                 let right_most_pointer = contents.rightmost_pointer().unwrap();
                 self.stack.advance();
                 let mem_page = self.read_page(right_most_pointer as usize)?;
-                self.going_upwards = false;
                 self.stack.push(mem_page);
             } else {
                 // Move to child left page
@@ -4909,7 +4908,6 @@ impl BTreeCursor {
                     }) => {
                         self.stack.advance();
                         let mem_page = self.read_page(left_child_page as usize)?;
-                        self.going_upwards = false;
                         self.stack.push(mem_page);
                     }
                     _ => unreachable!(),
