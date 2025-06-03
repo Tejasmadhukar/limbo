@@ -671,6 +671,12 @@ pub struct ImmutableRecord {
     recreating: bool,
 }
 
+#[derive(PartialEq)]
+pub enum ParseRecordState {
+    Init,
+    Parsing { payload: Vec<u8> },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Record {
     values: Vec<Value>,
@@ -899,6 +905,10 @@ impl ImmutableRecord {
     pub fn invalidate(&mut self) {
         self.payload.clear();
         self.values.clear();
+    }
+
+    pub fn is_invalidated(&self) -> bool {
+        self.payload.is_empty()
     }
 
     pub fn get_payload(&self) -> &[u8] {

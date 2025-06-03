@@ -10,7 +10,7 @@ use crate::{
         },
     },
     translate::{collate::CollationSeq, plan::IterationDirection},
-    types::{IndexKeyInfo, IndexKeySortOrder},
+    types::{IndexKeyInfo, IndexKeySortOrder, ParseRecordState},
     MvCursor,
 };
 
@@ -618,6 +618,8 @@ pub struct BTreeCursor {
     stack: PageStack,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: RefCell<Option<ImmutableRecord>>,
+    /// Reusable immutable record, used to allow better allocation strategy.
+    parse_record_state: RefCell<ParseRecordState>,
     pub index_key_info: Option<IndexKeyInfo>,
     /// Maintain count of the number of records in the btree. Used for the `Count` opcode
     count: usize,
@@ -649,7 +651,7 @@ impl BTreeCursor {
             mv_cursor,
             pager,
             root_page,
-            has_record: Cell::new(CursorHasRecord::No),
+            has_record: Cell::new(false),
             null_flag: false,
             going_upwards: false,
             state: CursorState::None,
@@ -3881,10 +3883,12 @@ impl BTreeCursor {
         }
     }
 
-    pub fn rowid(&self) -> Result<Option<i64>> {
+    pub fn rowid(&self) -> Result<CursorResult<Option<i64>>> {
         if let Some(mv_cursor) = &self.mv_cursor {
             let mv_cursor = mv_cursor.borrow();
-            return Ok(mv_cursor.current_row_id().map(|rowid| rowid.row_id));
+            return Ok(CursorResult::Ok(
+                mv_cursor.current_row_id().map(|rowid| rowid.row_id),
+            ));
         }
         Ok(match self.has_record.get() {
             CursorHasRecord::Yes { rowid: Some(rowid) } => Some(rowid),
@@ -3902,14 +3906,58 @@ impl BTreeCursor {
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
         self.has_record.replace(cursor_has_record);
-        Ok(CursorResult::Ok(matches!(
-            cursor_has_record,
-            CursorHasRecord::Yes { .. }
-        )))
+        Ok(CursorResult::Ok(cursor_has_record))
     }
 
-    pub fn record(&self) -> Ref<Option<ImmutableRecord>> {
-        self.reusable_immutable_record.borrow()
+    /// Return a reference to the record the cursor is currently pointing to.
+    /// If record was not parsed yet, then we have to parse it and in case of I/O we yield control
+    /// back.
+    pub fn record(&mut self) -> Result<CursorResult<Ref<Option<ImmutableRecord>>>> {
+        let invalidated = self
+            .reusable_immutable_record
+            .borrow()
+            .as_ref()
+            .map_or(true, |record| record.is_invalidated());
+        if !invalidated {
+            *self.parse_record_state.borrow_mut() = ParseRecordState::Init;
+            return Ok(CursorResult::Ok(self.reusable_immutable_record.borrow()));
+        }
+        if *self.parse_record_state.borrow() == ParseRecordState::Init {
+            *self.parse_record_state.borrow_mut() = ParseRecordState::Parsing {
+                payload: Vec::new(),
+            };
+        }
+        let page = self.stack.top();
+        return_if_locked_maybe_load!(self.pager, page);
+        let page = page.get();
+        let contents = page.get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        let cell = contents.cell_get(
+            cell_idx as usize,
+            payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
+            payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+            self.usable_space(),
+        )?;
+        let BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                    payload,
+                    payload_size,
+                    first_overflow_page,
+                    ..
+                }) = &cell
+                else {
+                    unreachable!("unexpected cell type: {:?}", cell);
+                };
+        if let Some(next_page) = first_overflow_page {
+            return_if_io!(self.process_overflow_read(payload, *next_page, *payload_size))
+        } else {
+            crate::storage::sqlite3_ondisk::read_record(
+                payload,
+                self.get_immutable_record_or_create().as_mut().unwrap(),
+            )?
+        };
+
+        *self.parse_record_state.borrow_mut() = ParseRecordState::Init;
+        Ok(CursorResult::Ok(self.reusable_immutable_record.borrow()))
     }
 
     #[instrument(skip_all, level = Level::TRACE)]
