@@ -3971,7 +3971,10 @@ impl BTreeCursor {
     /// Return a reference to the record the cursor is currently pointing to.
     /// If record was not parsed yet, then we have to parse it and in case of I/O we yield control
     /// back.
-    pub fn record(&self) -> Result<CursorResult<Ref<Option<ImmutableRecord>>>> {
+    pub fn record(&self) -> Result<CursorResult<Option<Ref<ImmutableRecord>>>> {
+        if !self.has_record.get() {
+            return Ok(CursorResult::Ok(None));
+        }
         let invalidated = self
             .reusable_immutable_record
             .borrow()
@@ -3979,7 +3982,10 @@ impl BTreeCursor {
             .map_or(true, |record| record.is_invalidated());
         if !invalidated {
             *self.parse_record_state.borrow_mut() = ParseRecordState::Init;
-            return Ok(CursorResult::Ok(self.reusable_immutable_record.borrow()));
+            let record_ref =
+                Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref())
+                    .unwrap();
+            return Ok(CursorResult::Ok(Some(record_ref)));
         }
         if *self.parse_record_state.borrow() == ParseRecordState::Init {
             *self.parse_record_state.borrow_mut() = ParseRecordState::Parsing {
@@ -4027,7 +4033,9 @@ impl BTreeCursor {
         };
 
         *self.parse_record_state.borrow_mut() = ParseRecordState::Init;
-        Ok(CursorResult::Ok(self.reusable_immutable_record.borrow()))
+        let record_ref =
+            Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref()).unwrap();
+        Ok(CursorResult::Ok(Some(record_ref)))
     }
 
     #[instrument(skip_all, level = Level::TRACE)]
@@ -4289,7 +4297,7 @@ impl BTreeCursor {
                         // FIXME(pere): cell index must be updated before calling `rowid` or
                         // `record`
                         let target_key = if page.is_index() {
-                            let record = match &*return_if_io!(self.record()) {
+                            let record = match return_if_io!(self.record()) {
                                 Some(record) => record.clone(),
                                 None => unreachable!("there should've been a record"),
                             };
@@ -6680,7 +6688,7 @@ mod tests {
             for key in keys.iter() {
                 tracing::trace!("seeking key: {:?}", key);
                 run_until_done(|| cursor.next(), pager.deref()).unwrap();
-                let record = cursor.record();
+                let record = run_until_done(|| cursor.record(), &pager).unwrap();
                 let record = record.as_ref().unwrap();
                 let cursor_key = record.get_values();
                 assert_eq!(

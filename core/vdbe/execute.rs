@@ -2154,7 +2154,7 @@ pub fn op_idx_ge(
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = *return_if_io!(cursor.record()) {
+        let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
@@ -2218,7 +2218,7 @@ pub fn op_idx_le(
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = *return_if_io!(cursor.record()) {
+        let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
@@ -2264,7 +2264,7 @@ pub fn op_idx_gt(
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = *return_if_io!(cursor.record()) {
+        let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
@@ -2310,7 +2310,7 @@ pub fn op_idx_lt(
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         let record_from_regs = make_record(&state.registers, start_reg, num_regs);
-        let pc = if let Some(ref idx_record) = *return_if_io!(cursor.record()) {
+        let pc = if let Some(ref idx_record) = return_if_io!(cursor.record()) {
             // Compare against the same number of values
             let idx_values = idx_record.get_values();
             let idx_values = &idx_values[..record_from_regs.len()];
