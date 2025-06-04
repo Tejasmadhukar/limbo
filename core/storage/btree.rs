@@ -1259,6 +1259,21 @@ impl BTreeCursor {
             );
 
             return_if_locked_maybe_load!(self.pager, mem_page_rc);
+            let mem_page = mem_page_rc.get();
+
+            let contents = mem_page.get().contents.as_ref().unwrap();
+            let cell_count = contents.cell_count();
+
+            let is_index = mem_page_rc.get().is_index();
+            let should_skip_advance = is_index
+                && self.going_upwards // we are going upwards, this means we still need to visit divider cell in an index
+                && self.stack.current_cell_index() < cell_count as i32; // if we weren't on a
+                                                                        // valid cell then it means we will have to move upwards again or move to right page,
+                                                                        // anyways, we won't visit this invalid cell index
+            if should_skip_advance {
+                self.going_upwards = false;
+                return Ok(CursorResult::Ok(true));
+            }
             // Important to advance only after loading the page in order to not advance > 1 times
             self.stack.advance();
             let cell_idx = self.stack.current_cell_index() as usize;
@@ -1267,10 +1282,6 @@ impl BTreeCursor {
                 mem_page_rc.get().get().id,
                 cell_idx
             );
-            let mem_page = mem_page_rc.get();
-
-            let contents = mem_page.get().contents.as_ref().unwrap();
-            let cell_count = contents.cell_count();
 
             if cell_count == 0 || cell_idx == cell_count {
                 // do rightmost
@@ -1335,8 +1346,6 @@ impl BTreeCursor {
                         return Ok(CursorResult::Ok(true));
                     } else {
                         let mem_page = self.read_page(*left_child_page as usize)?;
-                        // we still need to process this page later when going up, so let's go back
-                        self.stack.retreat();
                         self.stack.push(mem_page);
                         continue;
                     }
