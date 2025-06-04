@@ -736,6 +736,46 @@ impl BTreeCursor {
         loop {
             let page = self.stack.top();
 
+            return_if_locked_maybe_load!(self.pager, page);
+            let page = page.get();
+            let contents = page.get().contents.as_ref().unwrap();
+
+            let cell_count = contents.cell_count();
+            let cell_idx = self.stack.current_cell_index() as usize;
+            // dbg!(
+            //     page.get().id,
+            //     self.stack.current_cell_index(),
+            //     self.going_upwards,
+            //     page.get_contents().cell_count()
+            // );
+
+            // If we are at the end of the page and we haven't just come back from the right child,
+            // we now need to move to the rightmost child.
+            if self.stack.current_cell_index() == i32::MAX && !self.going_upwards {
+                let rightmost_pointer = contents.rightmost_pointer();
+                if let Some(rightmost_pointer) = rightmost_pointer {
+                    self.stack
+                        .push_backwards(self.read_page(rightmost_pointer as usize)?);
+                    continue;
+                }
+            }
+            if cell_idx >= cell_count {
+                self.stack.set_cell_index(cell_count as i32 - 1);
+            } else {
+                let is_index = page.is_index();
+                // skip retreat in case we still haven't visited this cell in index
+                let should_visit_internal_node = is_index && self.going_upwards; // we are going upwards, this means we still need to visit divider cell in an index
+                let page_type = contents.page_type();
+                if should_visit_internal_node {
+                    self.going_upwards = false;
+                    return Ok(CursorResult::Ok(true));
+                } else if matches!(
+                    page_type,
+                    PageType::IndexLeaf | PageType::TableLeaf | PageType::TableInterior
+                ) {
+                    self.stack.retreat();
+                }
+            }
             // moved to beginning of current page
             // todo: find a better way to flag moved to end or begin of page
             if self.stack.current_cell_index_less_than_min() {
@@ -748,34 +788,12 @@ impl BTreeCursor {
                         self.stack.pop();
                     } else {
                         // moved to begin of btree
+                        // dbg!(false);
                         return Ok(CursorResult::Ok(false));
                     }
                 }
                 // continue to next loop to get record from the new page
                 continue;
-            }
-
-            return_if_locked_maybe_load!(self.pager, page);
-            self.stack.retreat();
-            let page = page.get();
-            let contents = page.get().contents.as_ref().unwrap();
-
-            let cell_count = contents.cell_count();
-            let cell_idx = self.stack.current_cell_index() as usize;
-
-            // If we are at the end of the page and we haven't just come back from the right child,
-            // we now need to move to the rightmost child.
-            if cell_idx as i32 == i32::MAX && !self.going_upwards {
-                let rightmost_pointer = contents.rightmost_pointer();
-                if let Some(rightmost_pointer) = rightmost_pointer {
-                    self.stack
-                        .push_backwards(self.read_page(rightmost_pointer as usize)?);
-                    continue;
-                }
-            }
-
-            if cell_idx >= cell_count {
-                self.stack.set_cell_index(cell_count as i32 - 1);
             }
             let cell_idx = self.stack.current_cell_index() as usize;
 
@@ -810,7 +828,7 @@ impl BTreeCursor {
                         // left child has: key 663, key 664, key 665
                         // we need to move to the previous parent (with e.g. key 662) when iterating backwards.
                         let mem_page = self.read_page(left_child_page as usize)?;
-                        self.stack.advance();
+                        self.stack.retreat();
                         self.stack.push_backwards(mem_page);
                         continue;
                     }
