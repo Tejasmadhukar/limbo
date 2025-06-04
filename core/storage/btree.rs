@@ -411,6 +411,9 @@ enum CursorSeekState {
         /// This value is only used for indexbtree
         not_found_leaf: bool,
     },
+    /// In case value was not found in a leaf page, then we need to find in upper layer. This case
+    /// requires I/O for moving and for loading payload if it overflows so let's store it.
+    SeekingIndexMoveUp,
 }
 
 // These functions below exist to avoid problems with the borrow checker
@@ -1839,6 +1842,38 @@ impl BTreeCursor {
                 nearest_matching_cell,
                 not_found_leaf: false,
             };
+        } else if let CursorSeekState::SeekingIndexMoveUp = self.seek_state {
+            let page = self.stack.top();
+            return_if_locked_maybe_load!(self.pager, page);
+            let page = page.get();
+            let contents = page.get().contents.as_ref().unwrap();
+            let cur_cell_idx = self.stack.current_cell_index() as usize;
+            let cell = contents.cell_get(
+                cur_cell_idx,
+                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
+                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
+                self.usable_space(),
+            )?;
+            let BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                payload,
+                first_overflow_page,
+                payload_size,
+                ..
+            }) = &cell
+            else {
+                unreachable!("unexpected cell type: {:?}", cell);
+            };
+
+            if let Some(next_page) = first_overflow_page {
+                return_if_io!(self.process_overflow_read(payload, *next_page, *payload_size))
+            } else {
+                crate::storage::sqlite3_ondisk::read_record(
+                    payload,
+                    self.get_immutable_record_or_create().as_mut().unwrap(),
+                )?
+            };
+            let (_, found) = self.compare_with_current_record(key, seek_op);
+            return Ok(CursorResult::Ok(found));
         }
 
         let page = self.stack.top();
@@ -1878,14 +1913,26 @@ impl BTreeCursor {
                                 self.seek_state.set_not_found_leaf(true);
                                 self.stack.set_cell_index(cell_count as i32);
                             }
-                            return self.next();
+                            let next_res = return_if_io!(self.next());
+                            if !next_res {
+                                return Ok(CursorResult::Ok(false));
+                            }
+                            // FIXME: optimize this in case record can be read directly
+                            self.seek_state = CursorSeekState::SeekingIndexMoveUp;
+                            return Ok(CursorResult::IO);
                         }
                         IterationDirection::Backwards => {
                             if !self.seek_state.get_not_found_leaf() {
                                 self.seek_state.set_not_found_leaf(true);
                                 self.stack.set_cell_index(-1);
                             }
-                            return self.prev();
+                            let prev_res = return_if_io!(self.prev());
+                            if !prev_res {
+                                return Ok(CursorResult::Ok(false));
+                            }
+                            // FIXME: optimize this in case record can be read directly
+                            self.seek_state = CursorSeekState::SeekingIndexMoveUp;
+                            return Ok(CursorResult::IO);
                         }
                     }
                 };
@@ -1917,25 +1964,7 @@ impl BTreeCursor {
                     self.get_immutable_record_or_create().as_mut().unwrap(),
                 )?
             };
-            let cmp = {
-                let record = self.get_immutable_record();
-                let record = record.as_ref().unwrap();
-                let record_slice_equal_number_of_cols =
-                    &record.get_values().as_slice()[..key.get_values().len()];
-                compare_immutable(
-                    record_slice_equal_number_of_cols,
-                    key.get_values(),
-                    self.key_sort_order(),
-                    &self.collations,
-                )
-            };
-            let found = match seek_op {
-                SeekOp::GT => cmp.is_gt(),
-                SeekOp::GE => cmp.is_ge(),
-                SeekOp::EQ => cmp.is_eq(),
-                SeekOp::LE => cmp.is_le(),
-                SeekOp::LT => cmp.is_lt(),
-            };
+            let (cmp, found) = self.compare_with_current_record(key, seek_op);
             if found {
                 self.seek_state
                     .set_nearest_matching_cell(Some(cur_cell_idx as usize));
@@ -1964,6 +1993,34 @@ impl BTreeCursor {
                 }
             }
         }
+    }
+
+    fn compare_with_current_record(
+        &mut self,
+        key: &ImmutableRecord,
+        seek_op: SeekOp,
+    ) -> (Ordering, bool) {
+        let cmp = {
+            let record = self.get_immutable_record();
+            let record = record.as_ref().unwrap();
+            tracing::info!("record={}", record);
+            let record_slice_equal_number_of_cols =
+                &record.get_values().as_slice()[..key.get_values().len()];
+            compare_immutable(
+                record_slice_equal_number_of_cols,
+                key.get_values(),
+                self.key_sort_order(),
+                &self.collations,
+            )
+        };
+        let found = match seek_op {
+            SeekOp::GT => cmp.is_gt(),
+            SeekOp::GE => cmp.is_ge(),
+            SeekOp::EQ => cmp.is_eq(),
+            SeekOp::LE => cmp.is_le(),
+            SeekOp::LT => cmp.is_lt(),
+        };
+        (cmp, found)
     }
 
     fn read_record_w_possible_overflow(
