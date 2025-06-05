@@ -411,9 +411,6 @@ enum CursorSeekState {
         /// This value is only used for indexbtree
         not_found_leaf: bool,
     },
-    /// In case value was not found in a leaf page, then we need to find in upper layer. This case
-    /// requires I/O for moving and for loading payload if it overflows so let's store it.
-    SeekingIndexMoveUp,
 }
 
 // These functions below exist to avoid problems with the borrow checker
@@ -1859,7 +1856,7 @@ impl BTreeCursor {
                 nearest_matching_cell,
                 not_found_leaf: false,
             };
-        } else if let CursorSeekState::SeekingIndexMoveUp = self.seek_state {
+        } else if self.seek_state.get_not_found_leaf() {
             let page = self.stack.top();
             return_if_locked_maybe_load!(self.pager, page);
             let page = page.get();
@@ -1890,6 +1887,7 @@ impl BTreeCursor {
                 )?
             };
             let (_, found) = self.compare_with_current_record(key, seek_op);
+            self.seek_state.set_not_found_leaf(false);
             return Ok(CursorResult::Ok(found));
         }
 
@@ -1935,7 +1933,6 @@ impl BTreeCursor {
                                 return Ok(CursorResult::Ok(false));
                             }
                             // FIXME: optimize this in case record can be read directly
-                            self.seek_state = CursorSeekState::SeekingIndexMoveUp;
                             return Ok(CursorResult::IO);
                         }
                         IterationDirection::Backwards => {
@@ -1948,7 +1945,6 @@ impl BTreeCursor {
                                 return Ok(CursorResult::Ok(false));
                             }
                             // FIXME: optimize this in case record can be read directly
-                            self.seek_state = CursorSeekState::SeekingIndexMoveUp;
                             return Ok(CursorResult::IO);
                         }
                     }
