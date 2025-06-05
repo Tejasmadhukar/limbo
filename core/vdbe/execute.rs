@@ -3901,6 +3901,13 @@ pub fn op_idx_delete(
     else {
         unreachable!("unexpected Insn {:?}", insn)
     };
+    tracing::debug!(
+        "op_idx_delete(cursor_id={}, start_reg={}, num_regs={}, state={:?})",
+        cursor_id,
+        start_reg,
+        num_regs,
+        state.op_idx_delete_state
+    );
     loop {
         match &state.op_idx_delete_state {
             Some(OpIdxDeleteState::Seeking(record)) => {
@@ -3910,12 +3917,13 @@ pub fn op_idx_delete(
                     return_if_io!(
                         cursor.seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: true })
                     );
-                    tracing::debug!(
-                        "op_idx_delete(seek={}, record={} rowid={:?})",
-                        &record,
-                        return_if_io!(cursor.record()).as_ref().unwrap(),
-                        return_if_io!(cursor.rowid())
-                    );
+                }
+                state.op_idx_delete_state = Some(OpIdxDeleteState::Deleting);
+            }
+            Some(OpIdxDeleteState::Deleting) => {
+                {
+                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
                     if return_if_io!(cursor.rowid()).is_none() {
                         // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching
                         // index entry is found. This happens when running an UPDATE or DELETE statement and the
@@ -3924,16 +3932,9 @@ pub fn op_idx_delete(
                         // For those cases, P5 is zero. Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
                         return Err(LimboError::Corrupt(format!(
                             "IdxDelete: no matching index entry found for record {:?}",
-                            record
+                            make_record(&state.registers, start_reg, num_regs)
                         )));
                     }
-                }
-                state.op_idx_delete_state = Some(OpIdxDeleteState::Deleting);
-            }
-            Some(OpIdxDeleteState::Deleting) => {
-                {
-                    let mut cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.delete());
                 }
                 let n_change = program.n_change.get();
