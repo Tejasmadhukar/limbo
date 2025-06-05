@@ -738,13 +738,7 @@ impl BTreeCursor {
             let contents = page.get().contents.as_ref().unwrap();
 
             let cell_count = contents.cell_count();
-            let cell_idx = self.stack.current_cell_index() as usize;
-            // dbg!(
-            //     page.get().id,
-            //     self.stack.current_cell_index(),
-            //     self.going_upwards,
-            //     page.get_contents().cell_count()
-            // );
+            let cell_idx = self.stack.current_cell_index();
 
             // If we are at the end of the page and we haven't just come back from the right child,
             // we now need to move to the rightmost child.
@@ -756,7 +750,7 @@ impl BTreeCursor {
                     continue;
                 }
             }
-            if cell_idx >= cell_count {
+            if cell_idx >= cell_count as i32 {
                 self.stack.set_cell_index(cell_count as i32 - 1);
             } else {
                 let is_index = page.is_index();
