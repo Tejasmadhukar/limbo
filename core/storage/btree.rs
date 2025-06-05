@@ -3975,14 +3975,10 @@ impl BTreeCursor {
     pub fn prev(&mut self) -> Result<CursorResult<bool>> {
         assert!(self.mv_cursor.is_none());
         return_if_io!(self.restore_context());
-        match self.get_prev_record()? {
-            CursorResult::Ok(cursor_has_record) => {
-                self.has_record.replace(cursor_has_record);
-                self.invalidate_record();
-                Ok(CursorResult::Ok(cursor_has_record))
-            }
-            CursorResult::IO => Ok(CursorResult::IO),
-        }
+        let cursor_has_record = return_if_io!(self.get_prev_record());
+        self.has_record.replace(cursor_has_record);
+        self.invalidate_record();
+        Ok(CursorResult::Ok(cursor_has_record))
     }
 
     pub fn rowid(&self) -> Result<CursorResult<Option<i64>>> {
