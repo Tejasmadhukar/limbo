@@ -4562,6 +4562,7 @@ impl BTreeCursor {
                 DestroyState::LoadPage => {
                     let page = self.stack.top();
                     return_if_locked_maybe_load!(self.pager, page);
+                    self.stack.set_cell_index(0); // initialize to first cell of page when loaded.
 
                     let destroy_info = self
                         .state
