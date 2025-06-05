@@ -1400,7 +1400,7 @@ impl BTreeCursor {
     }
 
     /// Move the cursor to the rightmost record in the btree.
-    fn move_to_rightmost(&mut self) -> Result<CursorResult<()>> {
+    fn move_to_rightmost(&mut self) -> Result<CursorResult<bool>> {
         self.move_to_root();
 
         loop {
@@ -1413,8 +1413,9 @@ impl BTreeCursor {
             if contents.is_leaf() {
                 if contents.cell_count() > 0 {
                     self.stack.set_cell_index(contents.cell_count() as i32 - 1);
+                    return Ok(CursorResult::Ok(true));
                 }
-                return Ok(CursorResult::Ok(()));
+                return Ok(CursorResult::Ok(false));
             }
 
             match contents.rightmost_pointer() {
@@ -3950,13 +3951,10 @@ impl BTreeCursor {
 
     pub fn last(&mut self) -> Result<CursorResult<()>> {
         assert!(self.mv_cursor.is_none());
-        match self.move_to_rightmost()? {
-            CursorResult::Ok(_) => {
-                let _ = self.prev();
-                Ok(CursorResult::Ok(()))
-            }
-            CursorResult::IO => Ok(CursorResult::IO),
-        }
+        let cursor_has_record = return_if_io!(self.move_to_rightmost());
+        self.has_record.replace(cursor_has_record);
+        self.invalidate_record();
+        Ok(CursorResult::Ok(()))
     }
 
     pub fn next(&mut self) -> Result<CursorResult<bool>> {
