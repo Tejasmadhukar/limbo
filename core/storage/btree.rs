@@ -3801,6 +3801,7 @@ impl BTreeCursor {
         self.root_page = root.get().id;
         self.stack.clear();
         self.stack.push(root_btree.clone());
+        self.stack.set_cell_index(0); // leave parent pointing at the rightmost pointer (in this case 0, as there are no cells), since we will be balancing the rightmost child page.
         self.stack.push(child_btree.clone());
     }
 
