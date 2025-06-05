@@ -3854,15 +3854,14 @@ impl BTreeCursor {
     }
 
     pub fn seek_to_last(&mut self) -> Result<CursorResult<()>> {
-        return_if_io!(self.move_to_rightmost());
-        let cursor_has_record = return_if_io!(self.get_next_record());
+        let has_record = return_if_io!(self.move_to_rightmost());
         self.invalidate_record();
-        if !cursor_has_record {
+        self.has_record.replace(has_record);
+        if !has_record {
             let is_empty = return_if_io!(self.is_empty_table());
             assert!(is_empty);
             return Ok(CursorResult::Ok(()));
         }
-        self.has_record.replace(cursor_has_record);
         Ok(CursorResult::Ok(()))
     }
 
