@@ -4562,7 +4562,7 @@ impl BTreeCursor {
                 DestroyState::LoadPage => {
                     let page = self.stack.top();
                     return_if_locked_maybe_load!(self.pager, page);
-                    self.stack.set_cell_index(0); // initialize to first cell of page when loaded.
+                    self.stack.advance();
 
                     let destroy_info = self
                         .state
@@ -4593,7 +4593,6 @@ impl BTreeCursor {
                             (false, n) if n == contents.cell_count() as i32 => {
                                 if let Some(rightmost) = contents.rightmost_pointer() {
                                     let rightmost_page = self.read_page(rightmost as usize)?;
-                                    self.stack.advance();
                                     self.stack.push(rightmost_page);
                                     let destroy_info = self.state.mut_destroy_info().expect(
                                         "unable to get a mut reference to destroy state in cursor",
@@ -4662,7 +4661,6 @@ impl BTreeCursor {
                                     _ => panic!("expected interior cell"),
                                 };
                                 let child_page = self.read_page(child_page_id as usize)?;
-                                self.stack.advance();
                                 self.stack.push(child_page);
                                 let destroy_info = self.state.mut_destroy_info().expect(
                                     "unable to get a mut reference to destroy state in cursor",
@@ -4680,7 +4678,6 @@ impl BTreeCursor {
                             BTreeCell::IndexInteriorCell(index_int_cell) => {
                                 let child_page =
                                     self.read_page(index_int_cell.left_child_page as usize)?;
-                                self.stack.advance();
                                 self.stack.push(child_page);
                                 let destroy_info = self.state.mut_destroy_info().expect(
                                     "unable to get a mut reference to destroy state in cursor",
@@ -4690,7 +4687,6 @@ impl BTreeCursor {
                             }
                             //  For any leaf cell, advance the index now that overflow pages have been cleared
                             BTreeCell::TableLeafCell(_) | BTreeCell::IndexLeafCell(_) => {
-                                self.stack.advance();
                                 let destroy_info = self.state.mut_destroy_info().expect(
                                     "unable to get a mut reference to destroy state in cursor",
                                 );
