@@ -420,8 +420,9 @@ pub enum CursorSeekState {
         /// Indicates if we have seen an exact match during the downwards traversal of the btree.
         /// This is only needed in index seeks, in cases where we need to determine whether we call
         /// an additional next()/prev() to fetch a matching record from an interior node. We will not
-        /// do that if we haven't seen an EQ during the traversal, because that would leave the cursor
-        /// pointing to the wrong record.
+        /// do that if both are true:
+        /// 1. We have not seen an EQ during the traversal
+        /// 2. We are looking for an exact match ([SeekOp::GE] or [SeekOp::LE] with eq_only: true)
         eq_seen: Cell<bool>,
         /// Indicates when we have not not found a value in leaf and now will look in the next/prev record.
         /// This value is only used for indexbtree
