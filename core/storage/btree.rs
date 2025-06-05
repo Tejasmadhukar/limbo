@@ -708,71 +708,63 @@ impl BTreeCursor {
         start_next_page: u32,
         payload_size: u64,
     ) -> Result<CursorResult<()>> {
-        let res = match &mut *self.read_overflow_state.borrow_mut() {
-            None => {
-                tracing::debug!("start reading overflow page payload_size={}", payload_size);
-                let page = self.read_page(start_next_page as usize)?;
-                *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
-                    payload: payload.to_vec(),
-                    next_page: start_next_page,
-                    remaining_to_read: payload_size as usize - payload.len(),
-                    page,
-                });
-                CursorResult::IO
-            }
-            Some(ReadPayloadOverflow {
-                payload,
-                next_page,
-                remaining_to_read,
-                page: page_btree,
-            }) => {
-                if page_btree.get().is_locked() {
-                    return Ok(CursorResult::IO);
-                }
-                tracing::debug!("reading overflow page {} {}", next_page, remaining_to_read);
-                let page = page_btree.get();
-                let contents = page.get_contents();
-                // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
-                let next = contents.read_u32_no_offset(0);
-                let buf = contents.as_ptr();
-                let usable_space = self.pager.usable_space();
-                let to_read = (*remaining_to_read).min(usable_space - 4);
-                payload.extend_from_slice(&buf[4..4 + to_read]);
-                *remaining_to_read -= to_read;
-                if *remaining_to_read == 0 || next == 0 {
-                    assert!(
-                        *remaining_to_read == 0 && next == 0,
-                        "we can't have more pages to read while also have read everything"
-                    );
-                    let mut payload_swap = Vec::new();
-                    std::mem::swap(payload, &mut payload_swap);
-                    CursorResult::Ok(payload_swap)
-                } else {
-                    let new_page = self.pager.read_page(next as usize).map(|page| {
-                        Arc::new(BTreePageInner {
-                            page: RefCell::new(page),
-                        })
-                    })?;
-                    *page_btree = new_page;
-                    *next_page = next;
-                    CursorResult::IO
-                }
-            }
-        };
-        match res {
-            CursorResult::Ok(payload) => {
-                {
-                    let mut reuse_immutable = self.get_immutable_record_or_create();
-                    crate::storage::sqlite3_ondisk::read_record(
-                        &payload,
-                        reuse_immutable.as_mut().unwrap(),
-                    )?;
-                }
-                *self.read_overflow_state.borrow_mut() = None;
-                Ok(CursorResult::Ok(()))
-            }
-            CursorResult::IO => Ok(CursorResult::IO),
+        if self.read_overflow_state.borrow().is_none() {
+            let page = self.read_page(start_next_page as usize)?;
+            *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
+                payload: payload.to_vec(),
+                next_page: start_next_page,
+                remaining_to_read: payload_size as usize - payload.len(),
+                page,
+            });
+            return Ok(CursorResult::IO);
         }
+        let mut read_overflow_state = self.read_overflow_state.borrow_mut();
+        let ReadPayloadOverflow {
+            payload,
+            next_page,
+            remaining_to_read,
+            page: page_btree,
+        } = read_overflow_state.as_mut().unwrap();
+
+        if page_btree.get().is_locked() {
+            return Ok(CursorResult::IO);
+        }
+        tracing::debug!("reading overflow page {} {}", next_page, remaining_to_read);
+        let page = page_btree.get();
+        let contents = page.get_contents();
+        // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
+        let next = contents.read_u32_no_offset(0);
+        let buf = contents.as_ptr();
+        let usable_space = self.pager.usable_space();
+        let to_read = (*remaining_to_read).min(usable_space - 4);
+        payload.extend_from_slice(&buf[4..4 + to_read]);
+        *remaining_to_read -= to_read;
+
+        if *remaining_to_read != 0 && next != 0 {
+            let new_page = self.pager.read_page(next as usize).map(|page| {
+                Arc::new(BTreePageInner {
+                    page: RefCell::new(page),
+                })
+            })?;
+            *page_btree = new_page;
+            *next_page = next;
+            return Ok(CursorResult::IO);
+        }
+        assert!(
+            *remaining_to_read == 0 && next == 0,
+            "we can't have more pages to read while also have read everything"
+        );
+        let mut payload_swap = Vec::new();
+        std::mem::swap(payload, &mut payload_swap);
+
+        let mut reuse_immutable = self.get_immutable_record_or_create();
+        crate::storage::sqlite3_ondisk::read_record(
+            &payload_swap,
+            reuse_immutable.as_mut().unwrap(),
+        )?;
+
+        let _ = read_overflow_state.take();
+        Ok(CursorResult::Ok(()))
     }
 
     /// Calculates how much of a cell's payload should be stored locally vs in overflow pages
