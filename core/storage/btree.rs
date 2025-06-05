@@ -4011,11 +4011,10 @@ impl BTreeCursor {
             )?;
             if page_type.is_table() {
                 let BTreeCell::TableLeafCell(TableLeafCell {
-                        _rowid,
-                        _payload,
-                    ..
-                    }) = cell else {
-                        unreachable!("unexpected page_type");
+                    _rowid, _payload, ..
+                }) = cell
+                else {
+                    unreachable!("unexpected page_type");
                 };
                 Ok(CursorResult::Ok(Some(_rowid)))
             } else {
@@ -4376,10 +4375,9 @@ impl BTreeCursor {
                             };
                             DeleteSavepoint::Payload(record)
                         } else {
-                            let Some(rowid) = return_if_io!(self.rowid())
-                        else {
-                            panic!("cursor should be pointing to a record with a rowid");
-                        };
+                            let Some(rowid) = return_if_io!(self.rowid()) else {
+                                panic!("cursor should be pointing to a record with a rowid");
+                            };
                             DeleteSavepoint::Rowid(rowid)
                         };
                         let delete_info = self.state.mut_delete_info().unwrap();
