@@ -501,7 +501,7 @@ fn get_new_rowid<R: Rng>(cursor: &mut BTreeCursor, mut rng: R) -> Result<CursorR
     }
     let mut rowid = match cursor.rowid()? {
         CursorResult::Ok(Some(rowid)) => rowid.checked_add(1).unwrap_or(i64::MAX), // add 1 but be careful with overflows, in case of overflow - use i64::MAX
-        CursorResult::Ok(None) => 0,
+        CursorResult::Ok(None) => 1,
         CursorResult::IO => return Ok(CursorResult::IO),
     };
     if rowid > i64::MAX.try_into().unwrap() {
