@@ -1470,18 +1470,7 @@ impl BTreeCursor {
                         let left_child_page = contents.cell_table_interior_read_left_child_page(
                             leftmost_matching_cell as usize,
                         )?;
-                        // If we found our target rowid in the left subtree,
-                        // we need to move the parent cell pointer forwards or backwards depending on the iteration direction.
-                        // For example: since the internal node contains the max rowid of the left subtree, we need to move the
-                        // parent pointer backwards in backwards iteration so that we don't come back to the parent again.
-                        // E.g.
-                        // this parent: rowid 666
-                        // left child has: 664,665,666
-                        // we need to move to the previous parent (with e.g. rowid 663) when iterating backwards.
-                        let index_change =
-                            -1 + (iter_dir == IterationDirection::Forwards) as i32 * 2;
-                        self.stack
-                            .set_cell_index(leftmost_matching_cell as i32 + index_change);
+                        self.stack.set_cell_index(leftmost_matching_cell as i32);
                         let mem_page = self.read_page(left_child_page as usize)?;
                         self.stack.push(mem_page);
                         self.move_to_state = CursorMoveToState::ContinueLoop;
