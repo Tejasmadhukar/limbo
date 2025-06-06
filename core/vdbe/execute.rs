@@ -1339,11 +1339,16 @@ pub fn op_column(
         unreachable!("unexpected Insn {:?}", insn)
     };
     if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
-        let deferred_seek = {
+        let deferred_seek = 'd: {
             let rowid = {
                 let mut index_cursor = state.get_cursor(index_cursor_id);
                 let index_cursor = index_cursor.as_btree_mut();
-                return_if_io!(index_cursor.rowid())
+                match index_cursor.rowid()? {
+                    CursorResult::IO => {
+                        break 'd Some((index_cursor_id, table_cursor_id));
+                    }
+                    CursorResult::Ok(rowid) => rowid,
+                }
             };
             let mut table_cursor = state.get_cursor(table_cursor_id);
             let table_cursor = table_cursor.as_btree_mut();
@@ -1898,11 +1903,16 @@ pub fn op_row_id(
         unreachable!("unexpected Insn {:?}", insn)
     };
     if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seeks[*cursor_id].take() {
-        let deferred_seek = {
+        let deferred_seek = 'd: {
             let rowid = {
                 let mut index_cursor = state.get_cursor(index_cursor_id);
                 let index_cursor = index_cursor.as_btree_mut();
-                let record = return_if_io!(index_cursor.record());
+                let record = match index_cursor.record()? {
+                    CursorResult::IO => {
+                        break 'd Some((index_cursor_id, table_cursor_id));
+                    }
+                    CursorResult::Ok(record) => record,
+                };
                 let record = record.as_ref().unwrap();
                 let rowid = record.get_values().last().unwrap();
                 match rowid {
@@ -3872,11 +3882,6 @@ pub fn op_delete(
     {
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
-        tracing::debug!(
-            "op_delete(rowid    ={:?}, record={:?})",
-            cursor.rowid()?,
-            cursor.record()?,
-        );
         return_if_io!(cursor.delete());
     }
     let prev_changes = program.n_change.get();

@@ -67,6 +67,7 @@ jobs:
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
     steps:
       - name: Install cargo-c
         env:

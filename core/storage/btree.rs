@@ -176,7 +176,9 @@ enum DeleteState {
         cell_idx: usize,
         original_child_pointer: Option<u32>,
     },
-    CheckNeedsBalancing,
+    CheckNeedsBalancing {
+        rightmost_cell_was_dropped: bool,
+    },
     WaitForBalancingToComplete {
         target_key: DeleteSavepoint,
     },
@@ -1117,8 +1119,8 @@ impl BTreeCursor {
         }
         loop {
             let mem_page_rc = self.stack.top();
-            tracing::trace!(
-                "current_before_advance id={} cell={}",
+            tracing::debug!(
+                "next: current_before_advance id={} cell={}",
                 mem_page_rc.get().get().id,
                 self.stack.current_cell_index()
             );
@@ -1142,8 +1144,8 @@ impl BTreeCursor {
             // Important to advance only after loading the page in order to not advance > 1 times
             self.stack.advance();
             let cell_idx = self.stack.current_cell_index() as usize;
-            tracing::trace!(
-                "current id={} cell={}",
+            tracing::debug!(
+                "next:current id={} cell={}",
                 mem_page_rc.get().get().id,
                 cell_idx
             );
@@ -1619,7 +1621,12 @@ impl BTreeCursor {
         assert!(self.mv_cursor.is_none());
         let iter_dir = seek_op.iteration_direction();
 
-        if matches!(self.seek_state, CursorSeekState::Start { .. }) {
+        if matches!(
+            self.seek_state,
+            CursorSeekState::Start { .. }
+                | CursorSeekState::MovingBetweenPages { .. }
+                | CursorSeekState::InteriorPageBinarySearch { .. }
+        ) {
             // No need for another move_to_root. Move_to already moves to root
             return_if_io!(self.move_to(SeekKey::TableRowId(rowid), seek_op));
             let page = self.stack.top();
@@ -1733,7 +1740,12 @@ impl BTreeCursor {
         key: &ImmutableRecord,
         seek_op: SeekOp,
     ) -> Result<CursorResult<bool>> {
-        if matches!(self.seek_state, CursorSeekState::Start { .. }) {
+        if matches!(
+            self.seek_state,
+            CursorSeekState::Start { .. }
+                | CursorSeekState::MovingBetweenPages { .. }
+                | CursorSeekState::InteriorPageBinarySearch { .. }
+        ) {
             // No need for another move_to_root. Move_to already moves to root
             return_if_io!(self.move_to(SeekKey::IndexKey(key), seek_op));
             let CursorSeekState::FoundLeaf { eq_seen } = &self.seek_state else {
@@ -1785,7 +1797,10 @@ impl BTreeCursor {
             moving_up_to_parent,
         } = &self.seek_state
         else {
-            unreachable!("we must be in a leaf binary search state");
+            unreachable!(
+                "we must be in a leaf binary search state, got: {:?}",
+                self.seek_state
+            );
         };
 
         if moving_up_to_parent.get() {
@@ -2019,7 +2034,15 @@ impl BTreeCursor {
         // 5. We scan the leaf cells in the leaf page until we find the cell whose rowid is equal to the rowid we are looking for.
         //    This cell contains the actual data we are looking for.
         // 6. If we find the cell, we return the record. Otherwise, we return an empty result.
-        if matches!(self.seek_state, CursorSeekState::Start { .. }) {
+
+        // If we are at the beginning/end of seek state, start a new move from the root.
+        if matches!(
+            self.seek_state,
+            CursorSeekState::LeafPageBinarySearch { .. }
+        ) {
+            self.seek_state = CursorSeekState::Start;
+        }
+        if matches!(self.seek_state, CursorSeekState::Start) {
             self.move_to_root();
         }
 
@@ -4080,7 +4103,6 @@ impl BTreeCursor {
                     // find_cell() iterates the leaf page from left to right to find the insertion point anyway, so we don't care
                     // which cell we are in as long as we are on the right page.
                     // FIXME: find_cell() should not use linear search because it's slow.
-                    self.seek_state = CursorSeekState::Start;
                     match key {
                         BTreeKey::IndexKey(_) => {
                             return_if_io!(self.move_to(
@@ -4191,6 +4213,12 @@ impl BTreeCursor {
                         ));
                     }
 
+                    tracing::debug!(
+                        "DeleteState::FindCell: page_id: {}, cell_idx: {}",
+                        page.get().id,
+                        cell_idx
+                    );
+
                     let cell = contents.cell_get(
                         cell_idx,
                         payload_overflow_threshold_max(
@@ -4229,6 +4257,8 @@ impl BTreeCursor {
                     let page = page.get();
                     let contents = page.get_contents();
 
+                    let is_last_cell = cell_idx == contents.cell_count().saturating_sub(1);
+
                     let delete_info = self.state.mut_delete_info().unwrap();
                     if !contents.is_leaf() {
                         delete_info.state = DeleteState::InteriorNodeReplacement {
@@ -4240,7 +4270,9 @@ impl BTreeCursor {
                         drop_cell(contents, cell_idx, self.usable_space() as u16)?;
 
                         let delete_info = self.state.mut_delete_info().unwrap();
-                        delete_info.state = DeleteState::CheckNeedsBalancing;
+                        delete_info.state = DeleteState::CheckNeedsBalancing {
+                            rightmost_cell_was_dropped: is_last_cell,
+                        };
                     }
                 }
 
@@ -4317,10 +4349,14 @@ impl BTreeCursor {
                     drop_cell(parent_contents, cell_idx, self.usable_space() as u16)?;
 
                     let delete_info = self.state.mut_delete_info().unwrap();
-                    delete_info.state = DeleteState::CheckNeedsBalancing;
+                    delete_info.state = DeleteState::CheckNeedsBalancing {
+                        rightmost_cell_was_dropped: false, // TODO: when is this true?
+                    };
                 }
 
-                DeleteState::CheckNeedsBalancing => {
+                DeleteState::CheckNeedsBalancing {
+                    rightmost_cell_was_dropped,
+                } => {
                     let page = self.stack.top();
                     return_if_locked_maybe_load!(self.pager, page);
 
@@ -4330,9 +4366,15 @@ impl BTreeCursor {
                     let needs_balancing = self.stack.has_parent()
                         && free_space as usize * 3 > self.usable_space() * 2;
 
+                    if rightmost_cell_was_dropped {
+                        // If we drop a cell in the middle, e.g. our current index is 2 and we drop 'c' from [a,b,c,d,e], then we don't need to retreat index,
+                        // because index 2 is still going to be the right place [a,b,D,e]
+                        // but:
+                        // If we drop the rightmost cell, e.g. our current index is 4 and we drop 'e' from [a,b,c,d,e], then we need to retreat index,
+                        // because index 4 is now pointing beyond the last cell [a,b,c,d] _ <-- index 4
+                        self.stack.retreat();
+                    }
                     if needs_balancing {
-                        // FIXME(pere): cell index must be updated before calling `rowid` or
-                        // `record`
                         let target_key = if page.is_index() {
                             let record = match return_if_io!(self.record()) {
                                 Some(record) => record.clone(),
