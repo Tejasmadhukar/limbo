@@ -1156,7 +1156,7 @@ impl BTreeCursor {
                 cell_idx
             );
 
-            if cell_count == 0 || cell_idx == cell_count {
+            if cell_idx == cell_count {
                 // do rightmost
                 let has_parent = self.stack.has_parent();
                 match contents.rightmost_pointer() {
