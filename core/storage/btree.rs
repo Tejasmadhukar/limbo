@@ -4508,38 +4508,11 @@ impl BTreeCursor {
             Value::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
         };
-        let _ = return_if_io!(
-            self.move_to(SeekKey::TableRowId(*int_key), SeekOp::GE { eq_only: true })
-        );
-        self.seek_state = CursorSeekState::Start;
-        let page = self.stack.top();
-        // TODO(pere): request load
-        return_if_locked_maybe_load!(self.pager, page);
-
-        let page = page.get();
-        let contents = page.get().contents.as_ref().unwrap();
-
-        // find cell
-        let int_key = match key {
-            Value::Integer(i) => *i,
-            _ => unreachable!("btree tables are indexed by integers!"),
-        };
-        let cell_idx =
-            return_if_io!(self.find_cell(contents, &BTreeKey::new_table_rowid(int_key, None)));
-        if cell_idx >= contents.cell_count() {
-            Ok(CursorResult::Ok(false))
-        } else {
-            let equals = match &contents.cell_get(
-                cell_idx,
-                payload_overflow_threshold_max(contents.page_type(), self.usable_space() as u16),
-                payload_overflow_threshold_min(contents.page_type(), self.usable_space() as u16),
-                self.usable_space(),
-            )? {
-                BTreeCell::TableLeafCell(l) => l._rowid == int_key,
-                _ => unreachable!(),
-            };
-            Ok(CursorResult::Ok(equals))
-        }
+        let has_record =
+            return_if_io!(self.seek(SeekKey::TableRowId(*int_key), SeekOp::GE { eq_only: true }));
+        self.has_record.set(has_record);
+        self.invalidate_record();
+        Ok(CursorResult::Ok(has_record))
     }
 
     /// Clear the overflow pages linked to a specific page provided by the leaf cell
