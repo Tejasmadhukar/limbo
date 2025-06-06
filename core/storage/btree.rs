@@ -4613,7 +4613,6 @@ impl BTreeCursor {
                 DestroyState::LoadPage => {
                     let page = self.stack.top();
                     return_if_locked_maybe_load!(self.pager, page);
-                    self.stack.advance();
 
                     let destroy_info = self
                         .state
@@ -4623,8 +4622,8 @@ impl BTreeCursor {
                 }
                 DestroyState::ProcessPage => {
                     let page = self.stack.top();
+                    self.stack.advance();
                     assert!(page.get().is_loaded()); //  page should be loaded at this time
-
                     let page = page.get();
                     let contents = page.get().contents.as_ref().unwrap();
                     let cell_idx = self.stack.current_cell_index();
