@@ -1119,17 +1119,17 @@ impl BTreeCursor {
         }
         loop {
             let mem_page_rc = self.stack.top();
-            tracing::debug!(
-                "next: current_before_advance id={} cell={}",
-                mem_page_rc.get().get().id,
-                self.stack.current_cell_index()
-            );
-
             return_if_locked_maybe_load!(self.pager, mem_page_rc);
             let mem_page = mem_page_rc.get();
 
             let contents = mem_page.get().contents.as_ref().unwrap();
             let cell_count = contents.cell_count();
+            tracing::debug!(
+                "next: current_before_advance id={} cell={}, cell_count={}",
+                mem_page_rc.get().get().id,
+                self.stack.current_cell_index(),
+                cell_count
+            );
 
             let is_index = mem_page_rc.get().is_index();
             let should_skip_advance = is_index
@@ -1138,6 +1138,12 @@ impl BTreeCursor {
                                                                         // valid cell then it means we will have to move upwards again or move to right page,
                                                                         // anyways, we won't visit this invalid cell index
             if should_skip_advance {
+                tracing::debug!(
+                    "next: skipping advance, going_upwards: {}, page: {}, cell_idx: {}",
+                    self.going_upwards,
+                    mem_page_rc.get().get().id,
+                    self.stack.current_cell_index()
+                );
                 self.going_upwards = false;
                 return Ok(CursorResult::Ok(true));
             }
@@ -1244,6 +1250,8 @@ impl BTreeCursor {
     /// Move the cursor to the root page of the btree.
     #[instrument(skip_all, level = Level::TRACE)]
     fn move_to_root(&mut self) {
+        self.seek_state = CursorSeekState::Start;
+        self.going_upwards = false;
         tracing::trace!("move_to_root({})", self.root_page);
         let mem_page = self.read_page(self.root_page).unwrap();
         self.stack.clear();
@@ -1455,7 +1463,10 @@ impl BTreeCursor {
                 eq_seen,
             } = &self.seek_state
             else {
-                unreachable!("we must be in an interior binary search state");
+                unreachable!(
+                    "we must be in an interior binary search state, got {:?}",
+                    self.seek_state
+                );
             };
 
             loop {
@@ -2038,7 +2049,8 @@ impl BTreeCursor {
         // If we are at the beginning/end of seek state, start a new move from the root.
         if matches!(
             self.seek_state,
-            CursorSeekState::LeafPageBinarySearch { .. }
+            // these are stages that happen at the leaf page, so we can consider that the previous seek finished and we can start a new one.
+            CursorSeekState::LeafPageBinarySearch { .. } | CursorSeekState::FoundLeaf { .. }
         ) {
             self.seek_state = CursorSeekState::Start;
         }
@@ -2174,6 +2186,7 @@ impl BTreeCursor {
                     self.stack.set_cell_index(cell_idx as i32);
                     if overflow > 0 {
                         // A balance will happen so save the key we were inserting
+                        tracing::debug!("insert_into_page: balance triggered on key {:?}, page={:?}, cell_idx={}", bkey, page.get().get().id, cell_idx);
                         self.save_context(match bkey {
                             BTreeKey::TableRowId(rowid) => CursorContext::TableRowId(rowid.0),
                             BTreeKey::IndexKey(record) => {
@@ -2203,6 +2216,12 @@ impl BTreeCursor {
                 }
             };
         };
+        if matches!(self.state.write_info().unwrap().state, WriteState::Finish) {
+            // if there was a balance triggered, the cursor position is invalid.
+            // it's probably not the greatest idea in the world to do this eagerly here,
+            // but at least it works.
+            return_if_io!(self.restore_context());
+        }
         self.state = CursorState::None;
         ret
     }
@@ -3834,9 +3853,13 @@ impl BTreeCursor {
                         first_overflow_page,
                         payload_size,
                     ));
+                    let key_values = key.to_index_key_values();
+                    let record = self.get_immutable_record();
+                    let record = record.as_ref().unwrap();
+                    let record_same_number_cols = &record.get_values()[..key_values.len()];
                     let order = compare_immutable(
-                        key.to_index_key_values(),
-                        self.get_immutable_record().as_ref().unwrap().get_values(),
+                        key_values,
+                        record_same_number_cols,
                         self.key_sort_order(),
                         &self.collations,
                     );
@@ -4082,9 +4105,8 @@ impl BTreeCursor {
     pub fn insert(
         &mut self,
         key: &BTreeKey,
-        moved_before: bool, /* Indicate whether it's necessary to traverse to find the leaf page */
+        mut moved_before: bool, /* Indicate whether it's necessary to traverse to find the leaf page */
     ) -> Result<CursorResult<()>> {
-        tracing::trace!("insert");
         match &self.mv_cursor {
             Some(mv_cursor) => match key.maybe_rowid() {
                 Some(rowid) => {
@@ -4096,8 +4118,12 @@ impl BTreeCursor {
                 None => todo!("Support mvcc inserts with index btrees"),
             },
             None => {
-                tracing::trace!("moved {}", moved_before);
-                if !moved_before && !matches!(self.state, CursorState::Write(..)) {
+                tracing::debug!("insert(moved={}, key={:?}), valid_state={:?}, cursor_state={:?}, is_write_in_progress={}", moved_before, key, self.valid_state, self.state, self.is_write_in_progress());
+                if self.valid_state != CursorValidState::Valid && !self.is_write_in_progress() {
+                    // A balance happened so we need to move.
+                    moved_before = false;
+                }
+                if !moved_before {
                     // Use move_to() so that we always end up on a leaf page. seek() might go back to an interior cell in index seeks,
                     // which we never want. The reason we can use move_to() is that
                     // find_cell() iterates the leaf page from left to right to find the insertion point anyway, so we don't care
@@ -4120,15 +4146,12 @@ impl BTreeCursor {
                     self.context.take(); // we know where we wanted to move so if there was any saved context, discard it.
                     self.valid_state = CursorValidState::Valid;
                     self.seek_state = CursorSeekState::Start;
-                    tracing::info!(
+                    tracing::debug!(
                         "seeked to the right place, page is now {:?}",
                         self.stack.top().get().get().id
                     );
                 }
                 return_if_io!(self.insert_into_page(key));
-                // if we did a tree rebalance, eagerly seek to the right place again.
-                // might not be the right thing to do this eagerly, but we just want to make this work for starters...
-                return_if_io!(self.restore_context());
                 if key.maybe_rowid().is_some() {
                     self.has_record.replace(true);
                 }
@@ -4346,7 +4369,12 @@ impl BTreeCursor {
                         cell_idx,
                         self.usable_space() as u16,
                     )?;
+                    let is_last_parent_cell =
+                        cell_idx == parent_contents.cell_count().saturating_sub(1);
                     drop_cell(parent_contents, cell_idx, self.usable_space() as u16)?;
+                    if is_last_parent_cell {
+                        tracing::debug!("is_last_parent_cell: {:?}", parent_contents.cell_count());
+                    }
 
                     let delete_info = self.state.mut_delete_info().unwrap();
                     delete_info.state = DeleteState::CheckNeedsBalancing {
@@ -6505,14 +6533,14 @@ mod tests {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_secs(),
+                .as_millis(),
             |v| {
                 v.parse()
                     .expect("Failed to parse SEED environment variable as u64")
             },
         );
-        let rng = ChaCha8Rng::seed_from_u64(seed);
-        (rng, seed)
+        let rng = ChaCha8Rng::seed_from_u64(seed as u64);
+        (rng, seed as u64)
     }
 
     fn btree_insert_fuzz_run(
@@ -6659,7 +6687,6 @@ mod tests {
             let mut keys = SortedVec::new();
             tracing::info!("seed: {}", seed);
             for i in 0..inserts {
-                tracing::info!("insert {}", i);
                 pager.begin_read_tx().unwrap();
                 pager.begin_write_tx().unwrap();
                 let key = {
@@ -6678,6 +6705,7 @@ mod tests {
                     }
                     result
                 };
+                tracing::info!("insert {}/{}: {:?}", i + 1, inserts, key);
                 keys.push(key.clone());
                 let value = ImmutableRecord::from_registers(
                     &key.iter()
@@ -6704,22 +6732,62 @@ mod tests {
                     }
                 }
             }
+
+            // Check that all keys can be found by seeking
             pager.begin_read_tx().unwrap();
             cursor.move_to_root();
-            for key in keys.iter() {
-                tracing::trace!("seeking key: {:?}", key);
+            for (i, key) in keys.iter().enumerate() {
+                tracing::info!("seeking key {}/{}: {:?}", i + 1, keys.len(), key);
+                let exists = run_until_done(
+                    || {
+                        cursor.seek(
+                            SeekKey::IndexKey(&ImmutableRecord::from_registers(
+                                &key.iter()
+                                    .map(|col| Register::Value(Value::Integer(*col)))
+                                    .collect::<Vec<_>>(),
+                            )),
+                            SeekOp::GE { eq_only: true },
+                        )
+                    },
+                    pager.deref(),
+                )
+                .unwrap();
+                assert!(exists, "key {:?} is not found", key);
+            }
+            // Check that key count is right
+            cursor.move_to_root();
+            let mut count = 0;
+            while run_until_done(|| cursor.next(), pager.deref()).unwrap() {
+                count += 1;
+            }
+            assert_eq!(
+                count,
+                keys.len(),
+                "key count is not right, got {}, expected {}",
+                count,
+                keys.len()
+            );
+            // Check that all keys can be found in-order, by iterating the btree
+            cursor.move_to_root();
+            let mut prev = None;
+            for (i, key) in keys.iter().enumerate() {
+                tracing::info!("iterating key {}/{}: {:?}", i + 1, keys.len(), key);
                 run_until_done(|| cursor.next(), pager.deref()).unwrap();
                 let record = run_until_done(|| cursor.record(), &pager).unwrap();
                 let record = record.as_ref().unwrap();
-                let cursor_key = record.get_values();
-                assert_eq!(
-                    cursor_key,
-                    &key.iter()
-                        .map(|col| RefValue::Integer(*col))
-                        .collect::<Vec<_>>(),
-                    "key {:?} is not found",
-                    key
-                );
+                let cur = record.get_values().clone();
+                if let Some(prev) = prev {
+                    if prev >= cur {
+                        println!("Seed: {}", seed);
+                    }
+                    assert!(
+                        prev < cur,
+                        "keys are not in ascending order: {:?} < {:?}",
+                        prev,
+                        cur
+                    );
+                }
+                prev = Some(cur);
             }
             pager.end_read_tx().unwrap();
         }
