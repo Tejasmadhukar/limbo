@@ -381,7 +381,7 @@ enum OverflowState {
 
 /// Holds a Record or RowId, so that these can be transformed into a SeekKey to restore
 /// cursor position to its previous location.
-enum CursorContext {
+pub enum CursorContext {
     TableRowId(i64),
 
     /// If we are in an index tree we can then reuse this field to save
@@ -390,7 +390,8 @@ enum CursorContext {
 }
 
 /// In the future, we may expand these general validity states
-enum CursorValidState {
+#[derive(Debug, PartialEq, Eq)]
+pub enum CursorValidState {
     /// Cursor is pointing a to an existing location/cell in the Btree
     Valid,
     /// Cursor may be pointing to a non-existent location/cell. This can happen after balancing operations
@@ -431,16 +432,16 @@ pub enum CursorSeekState {
 }
 
 #[derive(Debug)]
-struct FindCellState(Option<usize>);
+struct FindCellState(Option<isize>);
 
 impl FindCellState {
     #[inline]
-    fn set(&mut self, cell_idx: usize) {
+    fn set(&mut self, cell_idx: isize) {
         self.0 = Some(cell_idx)
     }
 
     #[inline]
-    fn get_cell_idx(&mut self) -> usize {
+    fn get_cell_idx(&mut self) -> isize {
         self.0.expect("get can only be called after a set")
     }
 
@@ -482,7 +483,7 @@ pub struct BTreeCursor {
     /// Stores the cursor context before rebalancing so that a seek can be done later
     context: Option<CursorContext>,
     /// Store whether the Cursor is in a valid state. Meaning if it is pointing to a valid cell index or not
-    valid_state: CursorValidState,
+    pub valid_state: CursorValidState,
     /// Colations for Index Btree constraint checks
     /// Contains the Collation Seq for the whole Index
     /// This Vec should be empty for Table Btree
@@ -1226,14 +1227,16 @@ impl BTreeCursor {
     /// or e.g. find the first record greater than the seek key in a range query (e.g. SELECT * FROM table WHERE col > 10).
     /// We don't include the rowid in the comparison and that's why the last value from the record is not included.
     fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<CursorResult<bool>> {
-        match key {
+        let ret = return_if_io!(match key {
             SeekKey::TableRowId(rowid) => {
-                return self.tablebtree_seek(rowid, op);
+                self.tablebtree_seek(rowid, op)
             }
             SeekKey::IndexKey(index_key) => {
-                return self.indexbtree_seek(index_key, op);
+                self.indexbtree_seek(index_key, op)
             }
-        }
+        });
+        self.valid_state = CursorValidState::Valid;
+        Ok(CursorResult::Ok(ret))
     }
 
     /// Move the cursor to the root page of the btree.
@@ -1951,7 +1954,7 @@ impl BTreeCursor {
         let cmp = {
             let record = self.get_immutable_record();
             let record = record.as_ref().unwrap();
-            tracing::info!("record={}", record);
+            tracing::debug!("record={}", record);
             let record_slice_equal_number_of_cols =
                 &record.get_values().as_slice()[..key.get_values().len()];
             compare_immutable(
@@ -2068,6 +2071,7 @@ impl BTreeCursor {
                         // find cell
                         (return_if_io!(self.find_cell(page, bkey)), page.page_type())
                     };
+                    self.stack.set_cell_index(cell_idx as i32);
                     tracing::debug!("insert_into_page(cell_idx={})", cell_idx);
 
                     // if the cell index is less than the total cells, check: if its an existing
@@ -2145,13 +2149,24 @@ impl BTreeCursor {
                         contents.overflow_cells.len()
                     };
                     self.stack.set_cell_index(cell_idx as i32);
-                    let write_info = self
-                        .state
-                        .mut_write_info()
-                        .expect("can't count while inserting");
                     if overflow > 0 {
+                        // A balance will happen so save the key we were inserting
+                        self.save_context(match bkey {
+                            BTreeKey::TableRowId(rowid) => CursorContext::TableRowId(rowid.0),
+                            BTreeKey::IndexKey(record) => {
+                                CursorContext::IndexKeyRowId((*record).clone())
+                            }
+                        });
+                        let write_info = self
+                            .state
+                            .mut_write_info()
+                            .expect("can't count while inserting");
                         write_info.state = WriteState::BalanceStart;
                     } else {
+                        let write_info = self
+                            .state
+                            .mut_write_info()
+                            .expect("can't count while inserting");
                         write_info.state = WriteState::Finish;
                     }
                 }
@@ -3756,10 +3771,12 @@ impl BTreeCursor {
             self.find_cell_state.set(0);
         }
         let cell_count = page.cell_count();
-        while self.find_cell_state.get_cell_idx() < cell_count {
+        while self.find_cell_state.get_cell_idx() < cell_count as isize {
+            assert!(self.find_cell_state.get_cell_idx() >= 0);
+            let cell_idx = self.find_cell_state.get_cell_idx() as usize;
             match page
                 .cell_get(
-                    self.find_cell_state.get_cell_idx(),
+                    cell_idx,
                     payload_overflow_threshold_max(page.page_type(), self.usable_space() as u16),
                     payload_overflow_threshold_min(page.page_type(), self.usable_space() as u16),
                     self.usable_space(),
@@ -3812,6 +3829,8 @@ impl BTreeCursor {
             self.find_cell_state.set(cell_idx + 1);
         }
         let cell_idx = self.find_cell_state.get_cell_idx();
+        assert!(cell_idx >= 0);
+        let cell_idx = cell_idx as usize;
         assert!(cell_idx <= cell_count);
         self.find_cell_state.reset();
         Ok(CursorResult::Ok(cell_idx))
@@ -3912,7 +3931,7 @@ impl BTreeCursor {
         Ok(CursorResult::Ok(cursor_has_record))
     }
 
-    pub fn rowid(&self) -> Result<CursorResult<Option<i64>>> {
+    pub fn rowid(&mut self) -> Result<CursorResult<Option<i64>>> {
         if let Some(mv_cursor) = &self.mv_cursor {
             let mv_cursor = mv_cursor.borrow();
             return Ok(CursorResult::Ok(
@@ -3961,6 +3980,7 @@ impl BTreeCursor {
         self.invalidate_record();
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
+        self.valid_state = CursorValidState::Valid;
         self.has_record.replace(cursor_has_record);
         Ok(CursorResult::Ok(cursor_has_record))
     }
@@ -4055,22 +4075,38 @@ impl BTreeCursor {
             None => {
                 tracing::trace!("moved {}", moved_before);
                 if !moved_before && !matches!(self.state, CursorState::Write(..)) {
+                    // Use move_to() so that we always end up on a leaf page. seek() might go back to an interior cell in index seeks,
+                    // which we never want. The reason we can use move_to() is that
+                    // find_cell() iterates the leaf page from left to right to find the insertion point anyway, so we don't care
+                    // which cell we are in as long as we are on the right page.
+                    // FIXME: find_cell() should not use linear search because it's slow.
+                    self.seek_state = CursorSeekState::Start;
                     match key {
                         BTreeKey::IndexKey(_) => {
-                            return_if_io!(self.seek(
+                            return_if_io!(self.move_to(
                                 SeekKey::IndexKey(key.get_record().unwrap()),
                                 SeekOp::GE { eq_only: true }
                             ))
                         }
                         BTreeKey::TableRowId(_) => {
-                            return_if_io!(self.seek(
+                            return_if_io!(self.move_to(
                                 SeekKey::TableRowId(key.to_rowid()),
                                 SeekOp::GE { eq_only: true }
                             ))
                         }
                     };
+                    self.context.take(); // we know where we wanted to move so if there was any saved context, discard it.
+                    self.valid_state = CursorValidState::Valid;
+                    self.seek_state = CursorSeekState::Start;
+                    tracing::info!(
+                        "seeked to the right place, page is now {:?}",
+                        self.stack.top().get().get().id
+                    );
                 }
                 return_if_io!(self.insert_into_page(key));
+                // if we did a tree rebalance, eagerly seek to the right place again.
+                // might not be the right thing to do this eagerly, but we just want to make this work for starters...
+                return_if_io!(self.restore_context());
                 if key.maybe_rowid().is_some() {
                     self.has_record.replace(true);
                 }
@@ -4914,28 +4950,11 @@ impl BTreeCursor {
         }
     }
 
-    /// Save cursor context, to be restored later
-    // pub fn save_context(&mut self) {
-    //     if let CursorHasRecord::Yes { rowid } = self.has_record.get() {
-    //         self.valid_state = CursorValidState::RequireSeek;
-    //         match self.stack.top().get().get_contents().page_type() {
-    //             PageType::TableInterior | PageType::TableLeaf => {
-    //                 self.context = Some(CursorContext::TableRowId(rowid.expect(
-    //                     "table cells should have a rowid since we don't support WITHOUT ROWID tables",
-    //                 )));
-    //             }
-    //             PageType::IndexInterior | PageType::IndexLeaf => {
-    //                 self.context = Some(CursorContext::IndexKeyRowId(
-    //                     self.reusable_immutable_record
-    //                         .borrow()
-    //                         .as_ref()
-    //                         .unwrap()
-    //                         .clone(),
-    //                 ));
-    //             }
-    //         }
-    //     }
-    // }
+    // Save cursor context, to be restored later
+    pub fn save_context(&mut self, cursor_context: CursorContext) {
+        self.valid_state = CursorValidState::RequireSeek;
+        self.context = Some(cursor_context);
+    }
 
     /// If context is defined, restore it and set it None on success
     fn restore_context(&mut self) -> Result<CursorResult<()>> {
@@ -5107,18 +5126,6 @@ impl PageStack {
             self.cell_indices
         );
         self.cell_indices.borrow_mut()[current] -= 1;
-    }
-
-    /// Move the cursor to the next cell in the current page according to the iteration direction.
-    fn next_cell_in_direction(&self, iteration_direction: IterationDirection) {
-        match iteration_direction {
-            IterationDirection::Forwards => {
-                self.advance();
-            }
-            IterationDirection::Backwards => {
-                self.retreat();
-            }
-        }
     }
 
     fn set_cell_index(&self, idx: i32) {

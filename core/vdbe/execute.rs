@@ -1,6 +1,7 @@
 #![allow(unused_variables)]
 use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Schema;
+use crate::storage::btree::CursorValidState;
 use crate::storage::database::FileMemoryStorage;
 use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::pager::CreateBTreeFlags;
@@ -3839,7 +3840,10 @@ pub fn op_insert(
         // NOTE(pere): Sending moved_before == true is okay because we moved before but
         // if we were to set to false after starting a balance procedure, it might
         // leave undefined state.
-        return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(record)), true));
+        return_if_io!(cursor.insert(
+            &BTreeKey::new_table_rowid(key, Some(record)),
+            cursor.valid_state == CursorValidState::Valid
+        ));
         // Only update last_insert_rowid for regular table inserts, not schema modifications
         if cursor.root_page() != 1 {
             if let Some(rowid) = return_if_io!(cursor.rowid()) {
@@ -3869,9 +3873,9 @@ pub fn op_delete(
         let mut cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_btree_mut();
         tracing::debug!(
-            "op_delete(record={:?}, rowid={:?})",
-            cursor.record(),
-            cursor.rowid()?
+            "op_delete(rowid    ={:?}, record={:?})",
+            cursor.rowid()?,
+            cursor.record()?,
         );
         return_if_io!(cursor.delete());
     }
@@ -3978,7 +3982,7 @@ pub fn op_idx_insert(
             };
             // To make this reentrant in case of `moved_before` = false, we need to check if the previous cursor.insert started
             // a write/balancing operation. If it did, it means we already moved to the place we wanted.
-            let moved_before = if cursor.is_write_in_progress() {
+            let mut moved_before = if cursor.is_write_in_progress() {
                 true
             } else {
                 if index_meta.unique {
@@ -3997,6 +4001,11 @@ pub fn op_idx_insert(
                     flags.has(IdxInsertFlags::USE_SEEK)
                 }
             };
+
+            if cursor.valid_state != CursorValidState::Valid {
+                // A balance happened so we need to move.
+                moved_before = false;
+            }
 
             // Start insertion of row. This might trigger a balance procedure which will take care of moving to different pages,
             // therefore, we don't want to seek again if that happens, meaning we don't want to return on io without moving to the following opcode
