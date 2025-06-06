@@ -1309,6 +1309,13 @@ fn emit_update_insns(
                 dest: start_reg + num_regs - 1,
             });
 
+            program.emit_insn(Insn::MakeRecord {
+                start_reg,
+                count: num_regs,
+                dest_reg: record_reg,
+                index_name: Some(index.name.clone()),
+            });
+
             program.emit_insn(Insn::IdxDelete {
                 start_reg,
                 num_regs,

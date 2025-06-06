@@ -3976,7 +3976,12 @@ pub fn op_idx_insert(
             let cursor = cursor.as_btree_mut();
             let record = match &state.registers[record_reg] {
                 Register::Record(ref r) => r,
-                _ => return Err(LimboError::InternalError("expected record".into())),
+                o => {
+                    return Err(LimboError::InternalError(format!(
+                        "expected record, got {:?}",
+                        o
+                    )));
+                }
             };
             // To make this reentrant in case of `moved_before` = false, we need to check if the previous cursor.insert started
             // a write/balancing operation. If it did, it means we already moved to the place we wanted.
